@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# omp-sandboxed — run Oh My Pi (omp) inside a macOS Seatbelt sandbox.
+# https://github.com/Adornoo/omp-sandbox
+#
+# Write/read boundary:
+#   WRITE: $OMP_SANDBOX_WORKSPACE (default: $PWD)
+#          ~/.omp          ← OMP sessions, memories, logs (required)
+#          /private/tmp + $TMPDIR              ← macOS temp (required)
+#          /private/var/folders                ← Bun/Python caches (required)
+#          /dev                                ← device nodes (required)
+#          $OMP_SANDBOX_EXTRA_WRITE            ← colon-sep opt-in extra paths
+#   WRITE DENIED: everything else
+#
+#   READ (home allowlist — all other $HOME is denied):
+#          ~/.omp  +  $OMP_SANDBOX_WORKSPACE
+#   READ (system): /usr /System /Library /opt/homebrew /private/var /private/tmp /dev
+#          and all paths outside $HOME (via allow default)
+#   READ scope note: /Volumes and other /Users/* remain readable on this configuration.
+#          Add (deny file-read* (subpath "/Volumes")) to gen_profile if needed.
+#
+#   NETWORK: open — OMP needs model/provider APIs; Seatbelt has no per-domain filtering.
+#   YOLO:   off by default — set OMP_SANDBOX_YOLO=1 to auto-approve all tool calls.
+#
+# Usage:
+#   cd /your/project && omp-sandboxed [omp args...]    workspace = $PWD
+#   OMP_SANDBOX_WORKSPACE=/path omp-sandboxed [args]   explicit workspace
+#   OMP_SANDBOX_YOLO=1 omp-sandboxed                   auto-approve all tool calls
+#   omp-sandboxed --self-test                           verify boundaries, exit 0/1
+#   omp-sandboxed --print-profile                       print the Seatbelt profile
+#
+# Requirements: macOS (sandbox-exec present), omp installed (e.g. via Homebrew).
+set -euo pipefail
+
+OMP_BIN="$(command -v omp || true)"
+if [ -z "$OMP_BIN" ]; then
+  echo "omp-sandboxed: error: 'omp' not found on PATH" >&2; exit 1
+fi
+if [ ! -x /usr/bin/sandbox-exec ]; then
+  echo "omp-sandboxed: error: /usr/bin/sandbox-exec not found (requires macOS)" >&2; exit 1
+fi
+
+HOME_DIR="$HOME"
+
+# Canonicalize workspace: resolve symlinks and relative paths so Seatbelt's
+# (subpath ...) rules match the kernel-visible path.
+_workspace_raw="${OMP_SANDBOX_WORKSPACE:-$PWD}"
+# Expand a leading ~ in case the user exported the var with single quotes.
+case "$_workspace_raw" in "~"*) _workspace_raw="${HOME_DIR}${_workspace_raw#\~}";; esac
+if [ ! -d "$_workspace_raw" ]; then
+  echo "omp-sandboxed: error: workspace '$_workspace_raw' does not exist" >&2; exit 1
+fi
+WORKSPACE="$(cd "$_workspace_raw" && pwd -P)"
+
+if [ "$WORKSPACE" = "/" ] || [ "$WORKSPACE" = "$HOME_DIR" ]; then
+  echo "omp-sandboxed: warning: workspace is '$WORKSPACE' — this grants very broad write access" >&2
+fi
+
+TMPDIR_CANON="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+
+# sb_escape PATH — escape backslashes and double-quotes for SBPL string literals.
+# Rejects paths containing newlines (APFS does not permit them in filenames).
+sb_escape() {
+  case "$1" in *$'\n'*)
+    printf 'omp-sandboxed: error: path contains a newline and cannot be used in the profile: %s\n' "$1" >&2
+    exit 1
+    ;;
+  esac
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# Build extra write-allow rules from OMP_SANDBOX_EXTRA_WRITE (colon-separated).
+# Leading ~ expands to $HOME; each path is SBPL-escaped.
+EXTRA_RULES=""
+if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
+  IFS=':' read -ra _extra <<< "$OMP_SANDBOX_EXTRA_WRITE"
+  for p in "${_extra[@]}"; do
+    [ -n "$p" ] || continue
+    case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
+    EXTRA_RULES="${EXTRA_RULES}    (subpath \"$(sb_escape "$p")\")
+"
+  done
+fi
+
+gen_profile() {
+  # Escape all user-controlled paths before interpolating into SBPL.
+  local _esc_ws _esc_home _esc_tmp
+  _esc_ws="$(sb_escape "$WORKSPACE")"
+  _esc_home="$(sb_escape "$HOME_DIR")"
+  _esc_tmp="$(sb_escape "$TMPDIR_CANON")"
+
+  cat <<EOF
+(version 1)
+(allow default)
+
+;; --- write confinement: deny all writes, re-allow only required roots ---
+(deny file-write*)
+(allow file-write*
+    (subpath "${_esc_ws}")
+    (subpath "/private/tmp")
+    (subpath "${_esc_tmp}")
+    (subpath "${_esc_home}/.omp")
+${EXTRA_RULES})
+;; OS per-user scratch/caches and device nodes
+(allow file-write*
+    (subpath "/private/var/folders")
+    (subpath "/dev"))
+
+;; --- read confinement: deny all \$HOME, re-allow only what OMP requires ---
+;; Paths outside \$HOME (/usr, /System, /Library, /opt/homebrew, /private/*, etc.)
+;; remain readable via (allow default).
+(deny file-read* (subpath "${_esc_home}"))
+(allow file-read*
+    (subpath "${_esc_home}/.omp")
+    (subpath "${_esc_ws}"))
+EOF
+}
+
+export OMP_SANDBOX=seatbelt
+export PI_SANDBOX=seatbelt
+
+if [ "${1:-}" = "--self-test" ]; then
+  PROFILE="$(mktemp -t omp-sandbox)"
+  trap 'rm -f "$PROFILE"' EXIT
+  gen_profile > "$PROFILE"
+  _sb_fail=0
+
+  # Export probe paths as env vars so every bash -c string below can use
+  # single quotes — no user-controlled values are interpolated into shell strings.
+  export _SBX_WS="$WORKSPACE"
+  export _SBX_WS_PROBE="$WORKSPACE/.sbx_probe"
+  export _SBX_OMP_PROBE="$HOME_DIR/.omp/.sbx_probe"
+
+  # 1. workspace write allowed
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c 'echo ok > "$_SBX_WS_PROBE" && rm "$_SBX_WS_PROBE"' 2>/dev/null; then
+    echo "PASS: workspace write allowed"
+  else
+    echo "FAIL: workspace write allowed"; _sb_fail=1
+  fi
+
+  # 2. /etc write denied
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c 'echo x > /etc/.sbx_probe' 2>/dev/null; then
+    echo "FAIL: /etc write denied"; _sb_fail=1
+  else
+    echo "PASS: /etc write denied"
+  fi
+
+  # 2b. $HOME write denied — genuine Seatbelt denial (skip if HOME is allowlisted)
+  _home_denied_expected=1
+  case "$HOME_DIR/" in "$WORKSPACE"/*) _home_denied_expected=0 ;; esac
+  if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
+    IFS=':' read -ra _ew <<< "$OMP_SANDBOX_EXTRA_WRITE"
+    for p in "${_ew[@]}"; do
+      [ -n "$p" ] || continue
+      case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
+      p="${p%/}"
+      case "$HOME_DIR/" in "$p"/*) _home_denied_expected=0 ;; esac
+    done
+  fi
+  if [ "$_home_denied_expected" = 1 ]; then
+    export _SBX_HOME_PROBE="$HOME_DIR/.sbx_probe.$$"
+    if /usr/bin/sandbox-exec -f "$PROFILE" \
+        /bin/bash -c 'echo x > "$_SBX_HOME_PROBE"' 2>/dev/null; then
+      echo "FAIL: \$HOME write denied"; _sb_fail=1
+      rm -f "$_SBX_HOME_PROBE" 2>/dev/null || true
+    else
+      echo "PASS: \$HOME write denied"
+    fi
+  else
+    echo "SKIP: \$HOME write denied (HOME is allowlisted for this workspace)"
+  fi
+
+  # 3. ~/.omp write and read allowed (OMP needs both for config, memories, sessions)
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c 'echo x > "$_SBX_OMP_PROBE" && rm "$_SBX_OMP_PROBE"' 2>/dev/null; then
+    echo "PASS: ~/.omp write allowed"
+  else
+    echo "FAIL: ~/.omp write allowed"; _sb_fail=1
+  fi
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c 'ls "$HOME/.omp" >/dev/null' 2>/dev/null; then
+    echo "PASS: ~/.omp read allowed"
+  else
+    echo "FAIL: ~/.omp read allowed"; _sb_fail=1
+  fi
+
+  # 4. workspace read allowed (proves $HOME deny + re-allow resolves correctly)
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c 'ls "$_SBX_WS" >/dev/null' 2>/dev/null; then
+    echo "PASS: workspace read allowed"
+  else
+    echo "FAIL: workspace read allowed"; _sb_fail=1
+  fi
+
+  # 5. $HOME personal paths are read-denied
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c 'ls "$HOME/Library/Keychains" >/dev/null' 2>/dev/null; then
+    echo "FAIL: ~/Library/Keychains read denied"; _sb_fail=1
+  else
+    echo "PASS: ~/Library/Keychains read denied"
+  fi
+  if [ -d "$HOME_DIR/Library/Messages" ]; then
+    if /usr/bin/sandbox-exec -f "$PROFILE" \
+        /bin/bash -c 'ls "$HOME/Library/Messages" >/dev/null' 2>/dev/null; then
+      echo "FAIL: ~/Library/Messages read denied"; _sb_fail=1
+    else
+      echo "PASS: ~/Library/Messages read denied"
+    fi
+  fi
+  if [ -d "$HOME_DIR/Library/Mobile Documents" ]; then
+    if /usr/bin/sandbox-exec -f "$PROFILE" \
+        /bin/bash -c 'ls "$HOME/Library/Mobile Documents" >/dev/null' 2>/dev/null; then
+      echo "FAIL: ~/Library/Mobile Documents (iCloud) read denied"; _sb_fail=1
+    else
+      echo "PASS: ~/Library/Mobile Documents (iCloud) read denied"
+    fi
+  fi
+
+  # 6. omp boots and --auto-approve flag accepted (tests actual launch path)
+  if _omp_ver="$(/usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" --version 2>/dev/null)" && \
+     printf '%s\n' "$_omp_ver" | grep -q '^omp/'; then
+    echo "PASS: omp boots under sandbox"
+  else
+    echo "FAIL: omp boots under sandbox"; _sb_fail=1
+  fi
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      "$OMP_BIN" --auto-approve --version 2>/dev/null | grep -q '^[0-9]'; then
+    echo "PASS: --auto-approve flag accepted by omp"
+  else
+    echo "FAIL: --auto-approve flag accepted by omp"; _sb_fail=1
+  fi
+
+  # 7. sandbox env markers visible inside the sandbox
+  _env_out="$(/usr/bin/sandbox-exec -f "$PROFILE" /usr/bin/env 2>/dev/null || true)"
+  if printf '%s\n' "$_env_out" | grep -qx 'OMP_SANDBOX=seatbelt' && \
+     printf '%s\n' "$_env_out" | grep -qx 'PI_SANDBOX=seatbelt'; then
+    echo "PASS: sandbox env marker set"
+  else
+    echo "FAIL: sandbox env marker set"; _sb_fail=1
+  fi
+
+  exit "$_sb_fail"
+fi
+
+if [ "${1:-}" = "--print-profile" ]; then
+  gen_profile; exit 0
+fi
+
+PROFILE="$(mktemp -t omp-sandbox)"
+trap 'rm -f "$PROFILE"' EXIT
+gen_profile > "$PROFILE"
+
+# YOLO: auto-approve all tool calls when OMP_SANDBOX_YOLO=1 (opt-in).
+OMP_LAUNCH_ARGS=()
+if [ "${OMP_SANDBOX_YOLO:-0}" = 1 ]; then
+  OMP_LAUNCH_ARGS+=(--auto-approve)
+fi
+
+cd "$WORKSPACE"
+exec /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]}" "$@"
