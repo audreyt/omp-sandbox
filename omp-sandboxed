@@ -1,6 +1,27 @@
 #!/usr/bin/env bash
-# omp-sandboxed — run Oh My Pi (omp) inside a macOS Seatbelt sandbox.
+# omp-sandboxed — run Oh My Pi (omp) inside a macOS Seatbelt (sandbox-exec) sandbox.
 # https://github.com/bnivanov/omp-sandbox
+#
+# ISOLATION MODEL — READ THIS FIRST
+#   This is host macOS Seatbelt, not a VM or container. OMP and all child commands
+#   run at the same UID and in the same OS session as the invoking shell. Seatbelt
+#   restricts file I/O and process metadata, but does NOT provide:
+#     - Process separation (same UID; same-UID signals and IPC are unrestricted)
+#     - Network egress filtering (Seatbelt has no per-host/domain egress firewall;
+#       all network destinations remain reachable — use an external proxy/firewall)
+#     - Credential isolation: OMP injects PI_SESSION_FILE, PI_TOOL_BRIDGE_URL,
+#       PI_TOOL_BRIDGE_TOKEN, PI_TOOL_BRIDGE_SESSION into OMP-managed command/tool
+#       children's environment; those children can read these. PI_SESSION_FILE was
+#       observed mode 0644 (OMP should create it 0600 for cross-user defense, but
+#       that would not isolate same-UID sandbox children either way). This wrapper
+#       cannot suppress OMP-injected vars without breaking the tool bridge.
+#     - Executable denylists are not a security boundary in Seatbelt
+#   For strong isolation, use a separate VM or separate OS user account.
+#
+# PROCESS METADATA: denied except self
+#   The profile now denies process-info* (host process enumeration via /bin/ps,
+#   proc_listpids, proc_pidpath, etc.) and re-allows process-info* for the process
+#   itself. Residual: same-UID kill/signals and SHM/IPC remain unrestricted.
 #
 # Write/read boundary:
 #   WRITE: $OMP_SANDBOX_WORKSPACE (default: $PWD)
@@ -186,10 +207,18 @@ _sbx_canon_extra_path() {
 # _sbx_build_clean_env — populate _clean_env with the minimal env -i allowlist (Finding-3).
 # Called by both --self-test (adversarial canary) and the final exec so both paths
 # exercise identical policy. Pass provider keys with OMP_SANDBOX_PASS_ENV=VAR1:VAR2.
+#
+# Limitation: PI_TOOL_BRIDGE_TOKEN, PI_TOOL_BRIDGE_SESSION, PI_TOOL_BRIDGE_URL, and
+# PI_SESSION_FILE are injected by OMP into its tool children at runtime, inside the
+# sandbox, after this env -i boundary. They originate inside OMP — not in the launching
+# shell — so stripping them here has no effect. No supported OMP configuration knob
+# suppresses this injection. Isolating these credentials requires a separate UID or a
+# VM/container boundary outside this wrapper's reach.
 _sbx_build_clean_env() {
   local _sv _passval _passenv
   _clean_env=("HOME=$HOME_DIR" "TMPDIR=$TMPDIR_CANON" \
-              "OMP_SANDBOX=seatbelt" "PI_SANDBOX=seatbelt")
+              "OMP_SANDBOX=seatbelt" "PI_SANDBOX=seatbelt" \
+              "OTEL_SDK_DISABLED=true" "OTEL_TRACES_EXPORTER=none")  # preserve user OTel kill-switches; stripping exposes Bun node:http2 crash in downstream telemetry
   for _sv in PATH USER LOGNAME SHELL LANG LC_ALL LC_CTYPE LC_MESSAGES \
              TERM TERM_PROGRAM COLORTERM __CF_USER_TEXT_ENCODING COMMAND_MODE; do
     [ -n "${!_sv:-}" ] && _clean_env+=("$_sv=${!_sv}")
@@ -258,17 +287,26 @@ _sbx_build_extra_rules() {
 }
 _sbx_build_extra_rules
 
-
 gen_profile() {
   # Escape all user-controlled paths before interpolating into SBPL.
   local _esc_ws _esc_home _esc_tmp
   _esc_ws="$(sb_escape "$WORKSPACE")"
   _esc_home="$(sb_escape "$HOME_DIR")"
   _esc_tmp="$(sb_escape "$TMPDIR_CANON")"
-
   cat <<EOF
 (version 1)
 (allow default)
+;; --- process metadata: deny host process enumeration; allow self-inspection only ---
+;; OMP and child commands run at the same UID as the host shell. Without this rule
+;; any child can enumerate all host PIDs (via /bin/ps, proc_listpids, etc.) and
+;; read process metadata (argv, environment, open files) of unrelated processes.
+;; (allow process-info* (target self)) re-allows the process querying its own info,
+;; which is required by normal process startup (dyld, crash reporters, etc.).
+;; Residual: same-UID signals and IPC remain unrestricted — separate VM/UID isolation
+;; is required for strong process separation.
+(deny process-info*)
+(allow process-info* (target self))
+
 
 ;; --- write confinement: deny all writes, re-allow only required roots ---
 (deny file-write*)
@@ -320,7 +358,7 @@ if [ "${1:-}" = "--self-test" ]; then
   _sb_fail=0
   # Capture the user's original EXTRA_* so test 13 can restore $PROFILE to the
   # entry state after clobbering it with the canary dir. (No mnemon fold here —
-  # test 15 generates its own self-contained profile below.)
+  # test 16 generates its own self-contained profile below.)
   _entry_xw="${OMP_SANDBOX_EXTRA_WRITE:-}"
   _entry_xr="${OMP_SANDBOX_EXTRA_READ:-}"
 
@@ -330,7 +368,7 @@ if [ "${1:-}" = "--self-test" ]; then
   export _SBX_WS_PROBE="$WORKSPACE/.sbx_probe"
   export _SBX_OMP_PROBE="$HOME_DIR/.omp/.sbx_probe"
 
-  # Build clean env once here; tests 6, 7, 9, and 15 all use env -i "${_clean_env[@]}"
+  # Build clean env once here; tests 6, 7, 9, 15, and 16 all use env -i "${_clean_env[@]}"
   # so they exercise the same policy as the real exec path.
   _sbx_build_clean_env
 
@@ -418,6 +456,26 @@ if [ "${1:-}" = "--self-test" ]; then
     else
       echo "PASS: ~/Library/Mobile Documents (iCloud) read denied"
     fi
+  fi
+
+  # 5b. process-info* denial: /bin/ps must be denied; self-inspect (bash) must succeed
+  # Proves (deny process-info*) fires for host enumeration while (allow process-info*
+  # (target self)) permits the sandboxed process to query its own metadata.
+  # /bin/ps calls proc_listpids or getproclist (KERN_PROC_ALL) — both need process-info
+  # on arbitrary targets, so rc must be non-zero when the sandbox is applied.
+  # Compatibility guard: bash -c 'echo ok' must exit 0 (normal child execution is
+  # unaffected by this rule — it is about process METADATA access, not exec).
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/ps -axo pid= >/dev/null 2>/dev/null; then
+    echo "FAIL: host process enumeration (/bin/ps) should be denied by process-info* rule"; _sb_fail=1
+  else
+    echo "PASS: host process enumeration (/bin/ps -axo) denied"
+  fi
+  if /usr/bin/sandbox-exec -f "$PROFILE" \
+      /bin/bash -c 'echo ok' >/dev/null 2>/dev/null; then
+    echo "PASS: ordinary child execution unaffected (process-info* self-allow works)"
+  else
+    echo "FAIL: ordinary child execution broken (process-info* self-allow may be missing)"; _sb_fail=1
   fi
 
   # 6. omp boots under the clean env (matches real launch path — not inherited env)
@@ -595,7 +653,20 @@ else
 fi
 rm -rf "$_SBX_B32_DIR"
 
-  # 15. mnemon store reachable under a profile that allowlists ~/.mnemon via the
+# 15. OTEL kill-switches survive the env -i boundary. Without them the
+# wrapper strips the user's own kill-switches, exposing a Bun node:http2
+# crash (TypeError: authority must be string, received number 825110816
+# = 0x312e3120) in an OMP-launched telemetry path. Exact component
+# [INFERENCE]; public reproductions match Claude Code OTel gRPC issues.
+_t15_otel=$(env -i "${_clean_env[@]}" /bin/bash -c 'echo "SDK=${OTEL_SDK_DISABLED} TRACES=${OTEL_TRACES_EXPORTER}"')
+if [ "$_t15_otel" = "SDK=true TRACES=none" ]; then
+  echo "PASS: OTEL kill-switches present in clean env (OTEL_SDK_DISABLED=true, OTEL_TRACES_EXPORTER=none)"
+else
+  echo "FAIL: OTEL kill-switches missing or wrong in clean env: got '$_t15_otel'" >&2
+  _sb_fail=1
+fi
+
+  # 16. mnemon store reachable under a profile that allowlists ~/.mnemon via the
   # EXTRA_* mechanism (the same mechanism users use in production). SELF-
   # CONTAINED: this test generates its OWN profile (with EXTRA_*=~/.mnemon) rather
   # than reusing $PROFILE, so it cannot be silently fed or broken by test 13's
@@ -603,18 +674,18 @@ rm -rf "$_SBX_B32_DIR"
   # '"id"'), not just exit 0 — `mnemon recall` can exit 0 with empty output on
   # some failure modes, which would otherwise be a false pass.
   if [ -d "$HOME_DIR/.mnemon" ] && command -v mnemon >/dev/null 2>&1; then
-    _t15_prof="$(/usr/bin/mktemp -t omp-sandbox-t15)"
+    _t16_prof="$(/usr/bin/mktemp -t omp-sandbox-t16)"
     OMP_SANDBOX_EXTRA_WRITE="$HOME_DIR/.mnemon" \
     OMP_SANDBOX_EXTRA_READ="$HOME_DIR/.mnemon" \
-    OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$_t15_prof"
-    _t15_out=$(env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$_t15_prof" \
-        mnemon recall __omp_sandbox_selftest__ --limit 1 2>&1) || _t15_out=""
-    rm -f "$_t15_prof"
-    if printf '%s\n' "$_t15_out" | grep -q '"id"'; then
+    OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$_t16_prof"
+    _t16_out=$(env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$_t16_prof" \
+        mnemon recall __omp_sandbox_selftest__ --limit 1 2>&1) || _t16_out=""
+    rm -f "$_t16_prof"
+    if printf '%s\n' "$_t16_out" | grep -q '"id"'; then
       echo "PASS: mnemon store reachable under sandbox (recall returned a result)"
     else
       echo "FAIL: mnemon store NOT reachable under sandbox (recall returned no result)" >&2
-      printf '%s\n' "$_t15_out" | head -5 >&2
+      printf '%s\n' "$_t16_out" | head -5 >&2
       _sb_fail=1
     fi
   else

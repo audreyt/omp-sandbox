@@ -1,6 +1,14 @@
 # omp-sandbox
 
-A macOS [Seatbelt](https://www.chromium.org/developers/design-documents/sandbox/osx-sandboxing-design/) wrapper for [Oh My Pi (omp)](https://omp.dev) that confines the AI agent to a specific workspace directory with strict read and write boundaries — without patching omp or adding any runtime dependencies.
+A macOS [Seatbelt](https://www.chromium.org/developers/design-documents/sandbox/osx-sandboxing-design/) wrapper for [Oh My Pi (omp)](https://omp.dev) that applies Seatbelt filesystem and process-metadata restrictions to the AI agent — confining file writes to a workspace and explicit exceptions, denying most `$HOME` reads, and denying host process enumeration — without patching omp or adding any runtime dependencies.
+
+> **Isolation model — read this first.**
+> This is **host macOS Seatbelt**, not a VM or container. OMP and all child commands run at the **same UID and in the same OS session** as the invoking shell. Seatbelt restricts file I/O and process metadata (see below), but does **not** provide process separation, network egress filtering, or credential isolation from same-UID children. **For strong isolation, use a separate VM or OS user account.**
+>
+> - **OMP-injected environment variables** (`PI_SESSION_FILE`, `PI_TOOL_BRIDGE_URL`, `PI_TOOL_BRIDGE_TOKEN`, `PI_TOOL_BRIDGE_SESSION`) are injected by OMP itself into OMP-managed command/tool children's environment. This wrapper cannot suppress them without breaking the tool bridge. `PI_SESSION_FILE` was observed mode `0644`; OMP should create it `0600` for cross-user defense, but that would not isolate same-UID sandbox children either way.
+> - **Process metadata is now denied** except for the process itself (see table and security model below). Same-UID signals and IPC remain unrestricted.
+> - **Executable denylists are not a security boundary** in Seatbelt.
+> - **Network egress is fully open** — all hosts are reachable. An external proxy or firewall is required for network control.
 
 ## What it does
 
@@ -10,6 +18,7 @@ A macOS [Seatbelt](https://www.chromium.org/developers/design-documents/sandbox/
 | **Read ($HOME)** | Allowlist: `~/.omp` and your workspace only — everything else in `$HOME` is denied |
 | **Read (system)** | Open via `allow default` — OMP's runtimes need `/usr`, `/System`, `/Library`, `/opt/homebrew`, etc. |
 | **Network** | Open — Seatbelt cannot do per-domain filtering; OMP needs model APIs |
+| **Process metadata** | Denied for host processes; allowed for self only (`process-info* (target self)`) |
 | **YOLO** | Opt-in (`OMP_SANDBOX_YOLO=1`) — auto-approves all tool calls |
 
 Personal data that is read-denied by default: Keychain, Messages, Mail, Calendars, Contacts, iCloud Drive, Safari, Health, Wallet, Passes, and all other `$HOME` paths not in the allowlist.
@@ -137,21 +146,36 @@ Notes:
 
 By default the launcher uses `env -i` to give the sandboxed process only a minimal allowlist (PATH, HOME, TMPDIR, locale, terminal variables). All other shell variables — AWS credentials, GitHub tokens, and any other secrets in your shell — are **stripped automatically**.
 
+**OTel trace export is intentionally disabled in clean mode.** The wrapper hardcodes `OTEL_SDK_DISABLED=true` and `OTEL_TRACES_EXPORTER=none` in the clean env. Without these the user's own OTel kill-switches (set in `.zshrc`/`.bashrc`) are stripped by `env -i`, which exposed a Bun `node:http2` crash on first launch in a telemetry path launched or bundled by OMP (`TypeError: The "authority" argument must be of type string — received number 825110816`, where `825110816` = `0x312e3120` = ASCII `"1.1 "` — a protocol-line byte sequence). The exact downstream component is unidentified [INFERENCE]; public reproductions matching the number and stack are Claude Code OTel gRPC issues. OTEL endpoint and header variables are not forwarded; only the two standard disable flags are hardcoded.
+
 OMP needs its model provider key to operate. Pass it explicitly:
 
 ```bash
 OMP_SANDBOX_PASS_ENV=ANTHROPIC_API_KEY ~/.omp/sandbox/omp-sandboxed
 ```
 
-To revert to the old full-env behaviour (not recommended):
-
-```bash
-OMP_SANDBOX_INHERIT_ENV=1 ~/.omp/sandbox/omp-sandboxed
-```
+`OMP_SANDBOX_INHERIT_ENV=1` passes the full parent environment instead of the minimal allowlist — **insecure**: all shell secrets are exposed to the sandboxed process and every host it can reach. Use only for debugging.
 
 ### HOME verification
 
 The launcher resolves the real user home via `/usr/bin/dscl` and **rejects launch** if the inherited `$HOME` differs — this is the exact vector for read-confinement bypass (a malicious wrapper could set `HOME=/tmp` before launch). Set `OMP_SANDBOX_SKIP_HOME_VERIFY=1` to override.
+
+### Process metadata isolation
+
+The profile immediately after `(allow default)` adds:
+
+```scheme
+(deny process-info*)
+(allow process-info* (target self))
+```
+
+`process-info*` covers all process metadata operations: listing host PIDs (`proc_listpids`, `KERN_PROC_ALL`), reading argv/environment of another process (`proc_pidinfo`), and path lookup (`proc_pidpath`). Without this rule any sandboxed child could enumerate all running processes and read their metadata.
+
+`(allow process-info* (target self))` re-allows the process to query its own metadata, which is required by normal startup (dyld, crash reporters, signal handling).
+
+**Residual:** Same-UID `kill` and SHM/IPC are **not** covered by `process-info*`. A sandboxed child at the same UID can still signal the parent shell. There is no expressible Seatbelt rule to restrict signal direction between same-UID processes without also blocking OMP's own child management. Separate VM or OS user is required for full process separation.
+
+Proven on this configuration: `/bin/ps -axo pid=` exits rc71 (denied); `proc_listpids` count = 0; `proc_pidpath` returns 0 for arbitrary PIDs while succeeding for self. Self-test 5b asserts this behavior on every run.
 
 ### Known remaining surface
 
@@ -159,11 +183,25 @@ The launcher resolves the real user home via `/usr/bin/dscl` and **rejects launc
 - **Other `/Users/*` accounts** — readable on a multi-user Mac. Acceptable for a single-user personal machine.
 - **Network** — all hosts reachable. Use an external proxy/filter for egress control.
 - **`~/.omp`** — writable by the sandboxed process. A compromised agent could modify OMP's own memories and sessions.
+- **Same-UID PIDs/signals** — process-info* prevents metadata enumeration, but same-UID `kill` and SHM/IPC remain unrestricted. A separate OS user or VM is required for full process separation.
+- **OMP-injected bridge/session env vars** — `PI_SESSION_FILE`, `PI_TOOL_BRIDGE_URL`, `PI_TOOL_BRIDGE_TOKEN`, `PI_TOOL_BRIDGE_SESSION` are injected by OMP into OMP-managed command/tool children's environment. This wrapper cannot suppress them without breaking the tool bridge. `PI_SESSION_FILE` was observed mode `0644`; OMP should create it `0600` for cross-user defense, but that would not isolate same-UID sandbox children (they share the Seatbelt profile that allows `~/.omp`).
+- **Local service endpoints** — the tool bridge runs on a private loopback port reachable by any sandboxed child. Seatbelt is not a per-host/domain egress firewall; blocking local loopback would break the bridge.
 
-### What this does NOT protect against
+### What this does NOT protect against — non-VM threat model
 
-- Network exfiltration — OMP (and all child processes) can reach any host
-- Attacks through OMP's memory/session store — `~/.omp` is intentionally writable
+This wrapper applies a macOS Seatbelt (TrustedBSD MAC) policy to the OMP process tree. It is **not** a VM, container, or separate kernel namespace. That distinction produces unavoidable residual risks:
+
+| Risk | Reason | Mitigation outside this wrapper |
+|---|---|---|
+| **OMP-injected bridge/session credentials** | `PI_TOOL_BRIDGE_TOKEN`, `PI_TOOL_BRIDGE_URL`, `PI_TOOL_BRIDGE_SESSION`, `PI_SESSION_FILE` are injected by OMP into tool-child processes at runtime, inside the sandbox. They do not originate in the launching shell; `env -i` never sees them. No supported OMP config knob suppresses this injection. | Separate UID or VM/container boundary |
+| **Same-UID child file access** | OMP and all its child commands run as the same OS user. The Seatbelt profile allows `~/.omp`; any sandboxed child process therefore has the same read/write access to session files, history, and logs as OMP itself. `chmod 0600` on individual files protects against *other local users* only, not same-UID children. | Separate UID or VM/container boundary |
+| **Tool bridge loopback reachability** | The OMP tool bridge listens on a private loopback port. Seatbelt has no per-host/port egress filtering; any sandboxed child can connect to it. Blocking loopback would break the bridge. | VM/container with private network namespace |
+| **Network exfiltration** | OMP and all child processes can reach any network host. Seatbelt cannot do per-domain filtering. | External proxy/firewall for egress control |
+| **Same-UID signals and IPC** | `process-info*` blocks metadata enumeration, but same-UID `kill` and SHM/IPC are unrestricted. No expressible Seatbelt rule restricts signal direction between same-UID processes without also breaking OMP's own child management. | Separate UID or VM/container boundary |
+| **`~/.omp` store integrity** | `~/.omp` is intentionally writable; a compromised agent can modify OMP memories, sessions, and config. | Out of scope for a read/write sandbox |
+| **Executable controls** | Path-based execution controls are ineffective; any binary can be copied into the writable workspace. Seatbelt has no code-signing enforcement in this profile. | OS-level mandatory access control or VM |
+
+**Recommendation for high-risk workloads:** run OMP inside a VM or container with a private network namespace, a dedicated low-privilege UID, and an egress-filtering firewall. This wrapper materially narrows the *filesystem* attack surface on a shared machine and blocks host process enumeration, but it cannot substitute for OS-level UID or namespace isolation.
 
 ## Verifying the sandbox
 
@@ -179,6 +217,7 @@ All lines should read `PASS:` and the script exits 0. The self-test checks:
 - `~/.omp` is both readable and writable
 - Workspace reads work (proves the `$HOME` deny + re-allow rule resolves correctly)
 - Keychain, Messages, and iCloud reads are denied
+- Host process enumeration via `/bin/ps -axo` is **denied** by the `process-info*` rule; ordinary child execution (`/bin/bash -c 'echo ok'`) succeeds (`process-info* (target self)` allows self-inspection)
 - `omp --version` boots cleanly under the minimal clean environment (same as real launches)
 - `--auto-approve` flag is accepted by the installed omp version
 - `OMP_SANDBOX` and `PI_SANDBOX` env markers are present inside the clean env
@@ -190,6 +229,7 @@ All lines should read `PASS:` and the script exits 0. The self-test checks:
 - `OMP_SANDBOX_EXTRA_READ`'s sensitive-path gate fires end-to-end — `EXTRA_READ=~/.ssh` aborts profile generation with the sensitive-deny error unless `OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1` is set, in which case `~/.ssh` appears in the read allowlist as a `(subpath ...)` rule. Mirrors the `.ssh`-as-`EXTRA_WRITE` test; proves the new read-side opt-in path is gated the same way as `EXTRA_WRITE` (reading secrets is as bad as writing them)
 - an `OMP_SANDBOX_EXTRA_READ` path is actually **readable inside the sandbox** — with `EXTRA_READ` unset, `cat` of a canary file under a `$HOME` subdir that no baseline allowlist covers is denied by the `$HOME` read-deny rule; with `EXTRA_READ=that subdir`, `cat` succeeds (the `(subpath ...)` rule opened the `$HOME`-denied path). Placing the canary inside `$HOME` is what makes this meaningful — outside `$HOME` everything is already readable via `(allow default)`, so an outside-`$HOME` canary would pass either way and prove nothing. Mirrors self-tests #3/#4 (direct `sandbox-exec -f "$PROFILE" /bin/bash -c 'cat ...'`, not through omp).
 - the omp memory store is **reachable inside the sandbox** — when `mnemon` is installed and `~/.mnemon` exists, `mnemon recall` opens the database under a profile generated with `~/.mnemon` passed via `OMP_SANDBOX_EXTRA_WRITE`+`EXTRA_READ` (proving the `EXTRA_*` mechanism and the `$HOME`-node stat rule compose to cover the mnemon case the same way any user opt-in does). The self-test folds `~/.mnemon` into `EXTRA_*` automatically; in production you set them yourself. Skipped if `mnemon` is absent or the store dir does not exist.
+- `OTEL_SDK_DISABLED=true` and `OTEL_TRACES_EXPORTER=none` are present in the clean env seen by sandbox children — regression guard for the Bun `node:http2` first-launch crash (authority-as-integer `825110816`)
 
 ## Printing the active profile
 
