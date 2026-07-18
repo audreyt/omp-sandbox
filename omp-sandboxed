@@ -327,6 +327,7 @@ ${EXTRA_RULES})
 (deny file-read* (subpath "${_esc_home}"))
 (allow file-read*
     (subpath "${_esc_home}/.omp")
+    (subpath "${_esc_home}/.bun")
     (subpath "${_esc_ws}")
 ${EXTRA_READ_RULES})
 ;; --- home-node metadata: Go programs (filepath.EvalSymlinks / os.MkdirAll)
