@@ -1,726 +1,1112 @@
-#!/usr/bin/env bash
-# omp-sandboxed — run Oh My Pi (omp) inside a macOS Seatbelt (sandbox-exec) sandbox.
-# https://github.com/bnivanov/omp-sandbox
-#
-# ISOLATION MODEL — READ THIS FIRST
-#   This is host macOS Seatbelt, not a VM or container. OMP and all child commands
-#   run at the same UID and in the same OS session as the invoking shell. Seatbelt
-#   restricts file I/O and process metadata, but does NOT provide:
-#     - Process separation (same UID; same-UID signals and IPC are unrestricted)
-#     - Network egress filtering (Seatbelt has no per-host/domain egress firewall;
-#       all network destinations remain reachable — use an external proxy/firewall)
-#     - Credential isolation: OMP injects PI_SESSION_FILE, PI_TOOL_BRIDGE_URL,
-#       PI_TOOL_BRIDGE_TOKEN, PI_TOOL_BRIDGE_SESSION into OMP-managed command/tool
-#       children's environment; those children can read these. PI_SESSION_FILE was
-#       observed mode 0644 (OMP should create it 0600 for cross-user defense, but
-#       that would not isolate same-UID sandbox children either way). This wrapper
-#       cannot suppress OMP-injected vars without breaking the tool bridge.
-#     - Executable denylists are not a security boundary in Seatbelt
-#   For strong isolation, use a separate VM or separate OS user account.
-#
-# PROCESS METADATA: denied except self
-#   The profile now denies process-info* (host process enumeration via /bin/ps,
-#   proc_listpids, proc_pidpath, etc.) and re-allows process-info* for the process
-#   itself. Residual: same-UID kill/signals and SHM/IPC remain unrestricted.
-#
-# Write/read boundary:
-#   WRITE: $OMP_SANDBOX_WORKSPACE (default: $PWD)
-#          ~/.omp          ← OMP sessions, memories, logs (required)
-#          /private/tmp + $TMPDIR              ← macOS temp (required)
-#          /private/var/folders                ← Bun/Python caches (required)
-#          /dev                                ← device nodes (required)
-#          $OMP_SANDBOX_EXTRA_WRITE            ← colon-sep opt-in extra paths
-#          (mnemon: pass ~/.mnemon via EXTRA_WRITE+EXTRA_READ; see README)
-#   WRITE DENIED: everything else
-#
-#   READ (home allowlist — all other $HOME is denied):
-#          ~/.omp  +  $OMP_SANDBOX_WORKSPACE  +  $OMP_SANDBOX_EXTRA_READ
-#          (mnemon: pass ~/.mnemon via EXTRA_READ+EXTRA_WRITE; see README)
-#          (EXTRA_READ mirrors EXTRA_WRITE: same canonicalization + sensitive-path
-#           denylist; sensitive reads must be approved via OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1)
-#   READ (system): /usr /System /Library /opt/homebrew /private/var /private/tmp /dev
-#          and all paths outside $HOME (via allow default)
-#   READ scope note: /Volumes and other /Users/* remain readable on this configuration.
-#          Add (deny file-read* (subpath "/Volumes")) to gen_profile if needed.
-#
-#   NETWORK: open — OMP needs model/provider APIs; Seatbelt has no per-domain filtering.
-#   YOLO:   off by default — set OMP_SANDBOX_YOLO=1 to auto-approve all tool calls.
-#
-# Usage:
-#   cd /your/project && omp-sandboxed [omp args...]    workspace = $PWD
-#   OMP_SANDBOX_WORKSPACE=/path omp-sandboxed [args]   explicit workspace
-#   OMP_SANDBOX_YOLO=1 omp-sandboxed                   auto-approve all tool calls
-#   omp-sandboxed --self-test                           verify boundaries, exit 0/1
-#   omp-sandboxed --print-profile                       print the Seatbelt profile
-#
-# Environment (security — all default to the safe setting):
-#   OMP_SANDBOX_PASS_ENV=VAR:VAR2   colon-sep vars forwarded into the clean env.
-#                                   Required for provider API keys, e.g.:
-#                                   OMP_SANDBOX_PASS_ENV=ANTHROPIC_API_KEY
-#   OMP_SANDBOX_INHERIT_ENV=1       pass the full parent env instead (insecure)
-#   OMP_SANDBOX_SKIP_HOME_VERIFY=1  skip dscl HOME verification (insecure)
-#   OMP_SANDBOX_CONFIRM_WIDE=1      allow $HOME or / as workspace (insecure)
-#   OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1  allow .ssh/.aws/etc. in EXTRA_WRITE
-#   OMP_SANDBOX_EXTRA_READ             colon-sep opt-in extra read paths under $HOME
-#   OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1  allow .ssh/.aws/etc. in EXTRA_READ
-#
-# Requirements: macOS (sandbox-exec present), omp installed (e.g. via Homebrew).
-#   Compatibility: runs under Apple's stock /bin/bash (3.2.57) via the
-#   ${arr[@]+"${arr[@]}"} empty-array idiom (bash 3.x bug fixed in 4.4).
-set -euo pipefail
+#!/usr/bin/env bun
+/**
+ * Run Oh My Pi inside a macOS Seatbelt sandbox.
+ *
+ * Seatbelt confines filesystem access and host-process metadata. It does not
+ * isolate the current UID, IPC, signals, credentials exposed to child processes,
+ * or network egress. Use a separate OS user or VM for a stronger boundary.
+ */
 
-OMP_BIN="$(command -v omp || true)"
-if [ -z "$OMP_BIN" ]; then
-  echo "omp-sandboxed: error: 'omp' not found on PATH" >&2; exit 1
-fi
-if [ ! -x /usr/bin/sandbox-exec ]; then
-  echo "omp-sandboxed: error: /usr/bin/sandbox-exec not found (requires macOS)" >&2; exit 1
-fi
+import { spawn, spawnSync } from "node:child_process";
+import {
+  X_OK,
+  accessSync,
+  existsSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import process from "node:process";
 
-# Resolve home from the OS directory service rather than the inherited $HOME
-# to prevent environment-poisoning attacks on the read-deny policy (Finding-2).
-# All binaries are absolute-pathed; "NFSHomeDirectory: " is stripped verbatim so
-# home paths containing spaces are handled correctly (no awk field-splitting).
-# Fails closed: exits on dscl failure or HOME mismatch unless
-# OMP_SANDBOX_SKIP_HOME_VERIFY=1 is explicitly set.
-_dscl_raw="$(/usr/bin/dscl . -read "/Users/$(/usr/bin/id -un)" NFSHomeDirectory 2>/dev/null)" || true
-HOME_DIR=""
-case "$_dscl_raw" in
-  "NFSHomeDirectory: "*)
-    _dscl_candidate="${_dscl_raw#NFSHomeDirectory: }"
-    if [ -d "$_dscl_candidate" ]; then
-      HOME_DIR="$(cd "$_dscl_candidate" && pwd -P)"
-    else
-      echo "omp-sandboxed: error: dscl reported home '$_dscl_candidate' does not exist" >&2; exit 1
-    fi ;;
-esac
-if [ -z "$HOME_DIR" ]; then
-  if [ "${OMP_SANDBOX_SKIP_HOME_VERIFY:-0}" = "1" ]; then
-    echo "omp-sandboxed: warning: dscl home lookup failed; using inherited HOME (OMP_SANDBOX_SKIP_HOME_VERIFY=1)" >&2
-    HOME_DIR="$(cd "${HOME:?HOME is unset}" && pwd -P)"
-  else
-    echo "omp-sandboxed: error: could not verify user home via /usr/bin/dscl. Set OMP_SANDBOX_SKIP_HOME_VERIFY=1 to use inherited HOME (insecure)." >&2; exit 1
-  fi
-fi
-# Reject launch if the inherited HOME differs from the real home — a mismatch is the
-# exact attack vector the dscl lookup is meant to prevent (Finding-2).
-if [ "${HOME:-}" != "$HOME_DIR" ]; then
-  if [ "${OMP_SANDBOX_SKIP_HOME_VERIFY:-0}" = "1" ]; then
-    echo "omp-sandboxed: warning: inherited HOME ('${HOME:-}') differs from real home '$HOME_DIR'; using real home (OMP_SANDBOX_SKIP_HOME_VERIFY=1)" >&2
-  else
-    echo "omp-sandboxed: error: inherited HOME ('${HOME:-}') differs from real user home '$HOME_DIR'. Refusing to launch to prevent profile bypass. Set OMP_SANDBOX_SKIP_HOME_VERIFY=1 to override (insecure)." >&2; exit 1
-  fi
-fi
-export HOME="$HOME_DIR"
+const PROGRAM_NAME = "omp-sandboxed" as const;
+const DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" as const;
+const SANDBOX_MARKER = "seatbelt" as const;
+// Bun's node:http2 client can crash during OMP's first remote MCP handshake.
+// The observed failure exits in about 1.9 seconds; retry only that startup window.
+const STARTUP_RETRY_WINDOW_MS = 2_000;
 
-# Canonicalize workspace: resolve symlinks and relative paths so Seatbelt's
-# (subpath ...) rules match the kernel-visible path.
-_workspace_raw="${OMP_SANDBOX_WORKSPACE:-$PWD}"
-# Expand a leading ~ in case the user exported the var with single quotes.
-case "$_workspace_raw" in "~"*) _workspace_raw="${HOME_DIR}${_workspace_raw#\~}";; esac
-if [ ! -d "$_workspace_raw" ]; then
-  echo "omp-sandboxed: error: workspace '$_workspace_raw' does not exist" >&2; exit 1
-fi
-WORKSPACE="$(cd "$_workspace_raw" && pwd -P)"
+const ENVIRONMENT_NAMES = {
+  confirmSensitiveRead: "OMP_SANDBOX_CONFIRM_SENSITIVE_READ",
+  confirmSensitiveWrite: "OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE",
+  confirmWide: "OMP_SANDBOX_CONFIRM_WIDE",
+  extraRead: "OMP_SANDBOX_EXTRA_READ",
+  extraWrite: "OMP_SANDBOX_EXTRA_WRITE",
+  inherit: "OMP_SANDBOX_INHERIT_ENV",
+  pass: "OMP_SANDBOX_PASS_ENV",
+  skipHomeVerify: "OMP_SANDBOX_SKIP_HOME_VERIFY",
+  workspace: "OMP_SANDBOX_WORKSPACE",
+  yolo: "OMP_SANDBOX_YOLO",
+} as const;
 
-if [ "$WORKSPACE" = "/" ] || [ "$WORKSPACE" = "$HOME_DIR" ]; then
-  if [ "${OMP_SANDBOX_CONFIRM_WIDE:-0}" != "1" ]; then
-    echo "omp-sandboxed: error: workspace '$WORKSPACE' grants very broad access — refusing to launch. Set OMP_SANDBOX_CONFIRM_WIDE=1 to override." >&2
-    exit 1
-  fi
-  echo "omp-sandboxed: warning: workspace '$WORKSPACE' — very broad access confirmed by OMP_SANDBOX_CONFIRM_WIDE=1" >&2
-fi
+type EnvironmentName = (typeof ENVIRONMENT_NAMES)[keyof typeof ENVIRONMENT_NAMES];
+type SourceEnvironment = Readonly<Record<string, string | undefined>>;
+type ChildEnvironment = Record<string, string>;
 
-# Canonicalize TMPDIR and validate it is a known macOS scratch root (Finding-1).
-# An attacker-controlled TMPDIR pointing to $HOME would widen the write allowlist.
-# Re-export TMPDIR to the validated value so the sandboxed process inherits a safe path.
-_tmpdir_raw="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P || echo '/private/tmp')"
-case "$_tmpdir_raw" in
-  /private/tmp|/private/tmp/*|/private/var/folders/*)
-    TMPDIR_CANON="$_tmpdir_raw" ;;
-  *)
-    echo "omp-sandboxed: warning: TMPDIR ('$_tmpdir_raw') is not a known macOS scratch root — using /private/tmp for policy" >&2
-    TMPDIR_CANON="/private/tmp" ;;
-esac
-export TMPDIR="$TMPDIR_CANON"
+declare const absolutePathBrand: unique symbol;
+type AbsolutePath = string & { readonly [absolutePathBrand]: true };
 
-# sb_escape PATH — escape backslashes and double-quotes for SBPL string literals.
-# Rejects paths containing newlines (APFS does not permit them in filenames).
-sb_escape() {
-  case "$1" in *$'\n'*)
-    printf 'omp-sandboxed: error: path contains a newline and cannot be used in the profile: %s\n' "$1" >&2
-    exit 1
-    ;;
-  esac
-  local _s="${1//\\/\\\\}"          # backslash → double-backslash
-  printf '%s' "${_s//\"/\\\"}"      # double-quote → backslash double-quote
+interface CommandResult {
+  readonly exitCode: number;
+  readonly stderr: string;
+  readonly stdout: string;
 }
 
-# _sbx_sensitive_path PATH — returns 0 if PATH covers a sensitive home location (Finding-5).
-# Catches: _p is an ancestor of a sensitive dir, _p equals one, or _p is under one.
-_sbx_sensitive_path() {
-  local _p="$1" _s
-  for _s in \
-      "$HOME_DIR/.ssh"          "$HOME_DIR/.aws"              "$HOME_DIR/.gnupg" \
-      "$HOME_DIR/.netrc"        "$HOME_DIR/.netrc.gpg"        \
-      "$HOME_DIR/Library/Keychains"                            \
-      "$HOME_DIR/Library/LaunchAgents"                         \
-      "$HOME_DIR/Library/Application Support/Google"           \
-      "$HOME_DIR/Library/Safari"                               \
-      "$HOME_DIR/.bashrc"       "$HOME_DIR/.bash_profile"     \
-      "$HOME_DIR/.zshrc"        "$HOME_DIR/.zprofile"          \
-      "$HOME_DIR/.profile"
-  do
-    case "$_s/" in "$_p"*) return 0 ;; esac   # _p is ancestor of or equals _s
-    case "$_p/" in "$_s"*) return 0 ;; esac   # _p is at/under _s
-  done
-  return 1
+interface LaunchResult {
+  readonly elapsedMilliseconds: number;
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
 }
 
-# _sbx_canon_extra_path LABEL PATH — canonicalize an EXTRA_{WRITE,READ} candidate.
-# Rejects relative paths and explicit .. segments; resolves symlinks via cd+pwd -P
-# so _sbx_sensitive_path sees the real target, not an indirection alias. LABEL is
-# the originating env ("EXTRA_WRITE" / "EXTRA_READ") used in error messages.
-_sbx_canon_extra_path() {
-  local _label="$1" _raw="$2" _canon _dir _base
-  case "$_raw" in
-    /*) : ;;
-    *) echo "omp-sandboxed: error: ${_label} path '$_raw' must be absolute" >&2; exit 1 ;;
-  esac
-  case "$_raw" in
-    */../*|*/..|../*|..)
-      echo "omp-sandboxed: error: ${_label} path '$_raw' contains '..' — rejected to prevent traversal bypass" >&2; exit 1 ;;
-  esac
-  if _canon="$(cd "$_raw" 2>/dev/null && pwd -P)"; then
-    printf '%s' "$_canon"
-  else
-    _dir="${_raw%/*}"; _base="${_raw##*/}"
-    [ -z "$_dir" ] && _dir="/"
-    if _canon="$(cd "$_dir" 2>/dev/null && pwd -P)"; then
-      printf '%s/%s' "$_canon" "$_base"
-    else
-      echo "omp-sandboxed: error: ${_label} path '$_raw' cannot be canonicalized (parent does not exist)" >&2; exit 1
-    fi
-  fi
+interface CommandOptions {
+  readonly cwd?: AbsolutePath;
+  readonly env?: ChildEnvironment;
 }
 
-# _sbx_build_clean_env — populate _clean_env with the minimal env -i allowlist (Finding-3).
-# Called by both --self-test (adversarial canary) and the final exec so both paths
-# exercise identical policy. Pass provider keys with OMP_SANDBOX_PASS_ENV=VAR1:VAR2.
-#
-# Limitation: PI_TOOL_BRIDGE_TOKEN, PI_TOOL_BRIDGE_SESSION, PI_TOOL_BRIDGE_URL, and
-# PI_SESSION_FILE are injected by OMP into its tool children at runtime, inside the
-# sandbox, after this env -i boundary. They originate inside OMP — not in the launching
-# shell — so stripping them here has no effect. No supported OMP configuration knob
-# suppresses this injection. Isolating these credentials requires a separate UID or a
-# VM/container boundary outside this wrapper's reach.
-_sbx_build_clean_env() {
-  local _sv _passval _passenv
-  _clean_env=("HOME=$HOME_DIR" "TMPDIR=$TMPDIR_CANON" \
-              "OMP_SANDBOX=seatbelt" "PI_SANDBOX=seatbelt" \
-              "OTEL_SDK_DISABLED=true" "OTEL_TRACES_EXPORTER=none")  # preserve user OTel kill-switches; stripping exposes Bun node:http2 crash in downstream telemetry
-  for _sv in PATH USER LOGNAME SHELL LANG LC_ALL LC_CTYPE LC_MESSAGES \
-             TERM TERM_PROGRAM COLORTERM __CF_USER_TEXT_ENCODING COMMAND_MODE; do
-    [ -n "${!_sv:-}" ] && _clean_env+=("$_sv=${!_sv}")
-  done
-  if [ -n "${OMP_SANDBOX_PASS_ENV:-}" ]; then
-    IFS=':' read -ra _passenv <<< "$OMP_SANDBOX_PASS_ENV"
-    for _sv in "${_passenv[@]}"; do
-      [ -n "$_sv" ] || continue
-      _passval="${!_sv:-}"
-      if [ -n "$_passval" ]; then
-        _clean_env+=("$_sv=$_passval")
-      else
-        echo "omp-sandboxed: warning: OMP_SANDBOX_PASS_ENV: '$_sv' is not set or empty" >&2
-      fi
-    done
-  fi
+interface ExtraPaths {
+  readonly read: readonly AbsolutePath[];
+  readonly write: readonly AbsolutePath[];
 }
 
-# Build extra write+read allow rules from OMP_SANDBOX_EXTRA_WRITE / EXTRA_READ.
-# Colon-separated; each path is ~-expanded, canonicalized (resolves symlinks and
-# .. so the sensitive denylist sees the real target), sensitive-gated, and
-# SBPL-escaped. Idempotent: resets EXTRA_RULES/EXTRA_READ_RULES each call so it
-# can be re-run after the self-test folds ~/.mnemon into EXTRA_* (top-level runs
-# once at script entry; the self-test re-runs it to pick up the folded paths).
-# Reading secrets is as dangerous as writing them — EXTRA_READ applies the SAME
-# sensitive-path denylist as EXTRA_WRITE, with its own CONFIRM_SENSITIVE_READ gate.
-_sbx_build_extra_rules() {
-  EXTRA_RULES=""
-  if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
-    local _p
-    IFS=':' read -ra _sbx_exw <<< "$OMP_SANDBOX_EXTRA_WRITE"
-    for _p in "${_sbx_exw[@]}"; do
-      [ -n "$_p" ] || continue
-      case "$_p" in "~"*) _p="${HOME_DIR}${_p#\~}";; esac
-      _p="$(_sbx_canon_extra_path EXTRA_WRITE "$_p")"
-      if _sbx_sensitive_path "$_p"; then
-        if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE:-0}" != "1" ]; then
-          echo "omp-sandboxed: error: EXTRA_WRITE path '$_p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1 to override" >&2
-          exit 1
-        fi
-        echo "omp-sandboxed: warning: EXTRA_WRITE '$_p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_WRITE=1)" >&2
-      fi
-      EXTRA_RULES="${EXTRA_RULES}    (subpath \"$(sb_escape "$_p")\")
-"
-    done
-  fi
-  EXTRA_READ_RULES=""
-  if [ -n "${OMP_SANDBOX_EXTRA_READ:-}" ]; then
-    local _p
-    IFS=':' read -ra _sbx_exr <<< "$OMP_SANDBOX_EXTRA_READ"
-    for _p in "${_sbx_exr[@]}"; do
-      [ -n "$_p" ] || continue
-      case "$_p" in "~"*) _p="${HOME_DIR}${_p#\~}";; esac
-      _p="$(_sbx_canon_extra_path EXTRA_READ "$_p")"
-      if _sbx_sensitive_path "$_p"; then
-        if [ "${OMP_SANDBOX_CONFIRM_SENSITIVE_READ:-0}" != "1" ]; then
-          echo "omp-sandboxed: error: EXTRA_READ path '$_p' covers a sensitive home location — set OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1 to override" >&2
-          exit 1
-        fi
-        echo "omp-sandboxed: warning: EXTRA_READ '$_p' covers a sensitive home location (OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1)" >&2
-      fi
-      EXTRA_READ_RULES="${EXTRA_READ_RULES}    (subpath \"$(sb_escape "$_p")\")
-"
-    done
-  fi
+interface SandboxConfig {
+  readonly cleanEnvironment: ChildEnvironment;
+  readonly extraPaths: ExtraPaths;
+  readonly home: AbsolutePath;
+  readonly inheritEnvironment: boolean;
+  readonly ompExecutable: AbsolutePath;
+  readonly sandboxExecutable: AbsolutePath;
+  readonly sourceEnvironment: SourceEnvironment;
+  readonly temporaryDirectory: AbsolutePath;
+  readonly workspace: AbsolutePath;
+  readonly yolo: boolean;
 }
-_sbx_build_extra_rules
 
-gen_profile() {
-  # Escape all user-controlled paths before interpolating into SBPL.
-  local _esc_ws _esc_home _esc_tmp
-  _esc_ws="$(sb_escape "$WORKSPACE")"
-  _esc_home="$(sb_escape "$HOME_DIR")"
-  _esc_tmp="$(sb_escape "$TMPDIR_CANON")"
-  cat <<EOF
-(version 1)
+interface TemporaryProfile {
+  readonly directory: AbsolutePath;
+  readonly file: AbsolutePath;
+}
+
+class ConfigurationError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "ConfigurationError";
+  }
+}
+
+
+const HOST_EXECUTABLES = Object.freeze({
+  bash: absolutePath("/bin/bash", "bash path"),
+  dscl: absolutePath("/usr/bin/dscl", "dscl path"),
+  env: absolutePath("/usr/bin/env", "env path"),
+  id: absolutePath("/usr/bin/id", "id path"),
+  ls: absolutePath("/bin/ls", "ls path"),
+  ps: absolutePath("/bin/ps", "ps path"),
+  pwd: absolutePath("/bin/pwd", "pwd path"),
+  sandboxExec: absolutePath("/usr/bin/sandbox-exec", "sandbox-exec path"),
+  stat: absolutePath("/usr/bin/stat", "stat path"),
+});
+
+const CLEAN_ENVIRONMENT_PASSTHROUGH = [
+  "PATH",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "TERM",
+  "TERM_PROGRAM",
+  "COLORTERM",
+  "__CF_USER_TEXT_ENCODING",
+  "COMMAND_MODE",
+] as const;
+
+/**
+ * OMP can start OpenTelemetry paths backed by Bun's node:http2 implementation.
+ * A configured OTLP/gRPC exporter is one trigger for the numeric `authority`
+ * crash (825110816 / 0x312e3120), so disable every standard OTel signal. Remote
+ * HTTP MCP startup is another trigger and is covered by the bounded retry below.
+ * These values are applied last in clean and inherited modes and cannot be
+ * overridden through OMP_SANDBOX_PASS_ENV.
+ */
+const TELEMETRY_KILL_SWITCHES = Object.freeze({
+  OTEL_LOGS_EXPORTER: "none",
+  OTEL_METRICS_EXPORTER: "none",
+  OTEL_SDK_DISABLED: "true",
+  OTEL_TRACES_EXPORTER: "none",
+} satisfies Readonly<Record<string, string>>);
+
+const CONTROLLED_ENVIRONMENT_NAMES = new Set<string>([
+  "HOME",
+  "TMPDIR",
+  "OMP_SANDBOX",
+  "PI_SANDBOX",
+  ...Object.keys(TELEMETRY_KILL_SWITCHES),
+]);
+
+const SENSITIVE_HOME_PATHS = [
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".netrc",
+  ".netrc.gpg",
+  "Library/Keychains",
+  "Library/LaunchAgents",
+  "Library/Application Support/Google",
+  "Library/Safari",
+  ".bashrc",
+  ".bash_profile",
+  ".zshrc",
+  ".zprofile",
+  ".profile",
+] as const;
+
+function absolutePath(value: string, label: string): AbsolutePath {
+  if (!isAbsolute(value)) {
+    throw new ConfigurationError(`${label} must be absolute: ${JSON.stringify(value)}`);
+  }
+  return value as AbsolutePath;
+}
+
+function joinedPath(base: AbsolutePath, ...parts: readonly string[]): AbsolutePath {
+  return absolutePath(join(base, ...parts), "joined path");
+}
+
+function canonicalExistingDirectory(value: string, label: string): AbsolutePath {
+  const candidate = absolutePath(resolve(value), label);
+  let metadata: ReturnType<typeof statSync>;
+  try {
+    metadata = statSync(candidate);
+  } catch {
+    throw new ConfigurationError(`${label} does not exist: ${JSON.stringify(value)}`);
+  }
+  if (!metadata.isDirectory()) {
+    throw new ConfigurationError(`${label} is not a directory: ${JSON.stringify(value)}`);
+  }
+  try {
+    return absolutePath(realpathSync(candidate), label);
+  } catch {
+    // A parent Seatbelt profile can permit metadata for the directory node while
+    // denying realpath(3)'s broader traversal. chdir(2) + pwd -P needs only the
+    // access required by the original Bash wrapper and yields the same canonical path.
+    const result = spawnSync(HOST_EXECUTABLES.pwd, ["-P"], {
+      cwd: candidate,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const physicalPath = (result.stdout ?? "").trim();
+    if (result.status === 0 && isAbsolute(physicalPath)) {
+      return absolutePath(physicalPath, label);
+    }
+    throw new ConfigurationError(
+      `${label} cannot be canonicalized: ${JSON.stringify(value)}`,
+    );
+  }
+}
+
+function expandHome(value: string, home: AbsolutePath): string {
+  if (value === "~") return home;
+  if (value.startsWith("~/")) return `${home}${value.slice(1)}`;
+  return value;
+}
+
+function hasParentTraversal(value: string): boolean {
+  return value.split(/[\\/]+/u).includes("..");
+}
+
+function canonicalExtraPath(rawValue: string, label: string): AbsolutePath {
+  if (!isAbsolute(rawValue)) {
+    throw new ConfigurationError(`${label} path must be absolute: ${JSON.stringify(rawValue)}`);
+  }
+  if (hasParentTraversal(rawValue)) {
+    throw new ConfigurationError(
+      `${label} path contains '..' and was rejected: ${JSON.stringify(rawValue)}`,
+    );
+  }
+
+  const normalized = absolutePath(resolve(rawValue), `${label} path`);
+  try {
+    return absolutePath(realpathSync(normalized), `${label} path`);
+  } catch {
+    const parent = dirname(normalized);
+    try {
+      const canonicalParent = canonicalExistingDirectory(parent, `${label} parent`);
+      return joinedPath(canonicalParent, normalized.slice(parent.length + (parent === "/" ? 0 : 1)));
+    } catch {
+      throw new ConfigurationError(
+        `${label} path cannot be canonicalized because its parent does not exist: ${JSON.stringify(rawValue)}`,
+      );
+    }
+  }
+}
+
+function isWithinOrEqual(parent: AbsolutePath, candidate: AbsolutePath): boolean {
+  const difference = relative(parent, candidate);
+  return (
+    difference === "" ||
+    (difference !== ".." && !difference.startsWith(`..${sep}`) && !isAbsolute(difference))
+  );
+}
+
+function overlapsSensitiveHomePath(candidate: AbsolutePath, home: AbsolutePath): boolean {
+  return SENSITIVE_HOME_PATHS.some((relativeSensitivePath: string): boolean => {
+    const sensitive = joinedPath(home, relativeSensitivePath);
+    return isWithinOrEqual(candidate, sensitive) || isWithinOrEqual(sensitive, candidate);
+  });
+}
+
+function enabled(environment: SourceEnvironment, name: EnvironmentName): boolean {
+  return environment[name] === "1";
+}
+
+function warn(message: string): void {
+  console.error(`${PROGRAM_NAME}: warning: ${message}`);
+}
+
+function resolveExtraPathList(
+  environment: SourceEnvironment,
+  home: AbsolutePath,
+  kind: "READ" | "WRITE",
+): readonly AbsolutePath[] {
+  const valueName = kind === "READ" ? ENVIRONMENT_NAMES.extraRead : ENVIRONMENT_NAMES.extraWrite;
+  const confirmationName =
+    kind === "READ"
+      ? ENVIRONMENT_NAMES.confirmSensitiveRead
+      : ENVIRONMENT_NAMES.confirmSensitiveWrite;
+  const rawList = environment[valueName];
+  if (rawList === undefined || rawList === "") return Object.freeze([]);
+
+  const resolved: AbsolutePath[] = [];
+  for (const rawEntry of rawList.split(":")) {
+    if (rawEntry === "") continue;
+    const candidate = canonicalExtraPath(expandHome(rawEntry, home), `EXTRA_${kind}`);
+    if (overlapsSensitiveHomePath(candidate, home)) {
+      if (!enabled(environment, confirmationName)) {
+        throw new ConfigurationError(
+          `EXTRA_${kind} path ${JSON.stringify(candidate)} covers a sensitive home location; ` +
+            `set ${confirmationName}=1 to override (insecure)`,
+        );
+      }
+      warn(
+        `EXTRA_${kind} ${JSON.stringify(candidate)} covers a sensitive home location ` +
+          `(${confirmationName}=1)`,
+      );
+    }
+    resolved.push(candidate);
+  }
+  return Object.freeze([...new Set(resolved)]);
+}
+
+function resolveExtraPaths(environment: SourceEnvironment, home: AbsolutePath): ExtraPaths {
+  return Object.freeze({
+    read: resolveExtraPathList(environment, home, "READ"),
+    write: resolveExtraPathList(environment, home, "WRITE"),
+  });
+}
+
+function runCommand(
+  executable: AbsolutePath,
+  arguments_: readonly string[],
+  options: CommandOptions = {},
+): CommandResult {
+  const result = spawnSync(executable, [...arguments_], {
+    cwd: options.cwd,
+    encoding: "utf8",
+    env: options.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.error !== undefined) throw result.error;
+  return Object.freeze({
+    exitCode: result.status ?? 1,
+    stderr: result.stderr ?? "",
+    stdout: result.stdout ?? "",
+  });
+}
+
+function assertExecutable(path: AbsolutePath, label: string): void {
+  try {
+    accessSync(path, X_OK);
+  } catch {
+    throw new ConfigurationError(`${label} is not executable: ${path}`);
+  }
+}
+
+function findExecutable(
+  name: string,
+  pathValue: string | undefined,
+  workingDirectory: AbsolutePath,
+): AbsolutePath | undefined {
+  if (name.includes("/")) {
+    const explicit = absolutePath(resolve(workingDirectory, name), `${name} path`);
+    try {
+      accessSync(explicit, X_OK);
+      return explicit;
+    } catch {
+      return undefined;
+    }
+  }
+
+  for (const pathEntry of (pathValue ?? DEFAULT_PATH).split(":")) {
+    const directory = pathEntry === "" ? workingDirectory : resolve(workingDirectory, pathEntry);
+    const candidate = absolutePath(resolve(directory, name), `${name} path`);
+    try {
+      accessSync(candidate, X_OK);
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // Continue to the next PATH entry.
+    }
+  }
+  return undefined;
+}
+
+function resolveVerifiedHome(environment: SourceEnvironment): AbsolutePath {
+  const skipVerification = enabled(environment, ENVIRONMENT_NAMES.skipHomeVerify);
+  const userResult = runCommand(HOST_EXECUTABLES.id, ["-un"]);
+  const userName = userResult.stdout.trim();
+  let verifiedHome: AbsolutePath | undefined;
+
+  if (userResult.exitCode === 0 && userName !== "") {
+    const directoryServiceResult = runCommand(HOST_EXECUTABLES.dscl, [
+      ".",
+      "-read",
+      `/Users/${userName}`,
+      "NFSHomeDirectory",
+    ]);
+    const prefix = "NFSHomeDirectory: ";
+    const output = directoryServiceResult.stdout.trimEnd();
+    if (directoryServiceResult.exitCode === 0 && output.startsWith(prefix)) {
+      const reportedHome = output.slice(prefix.length);
+      verifiedHome = canonicalExistingDirectory(reportedHome, "directory-service home");
+    }
+  }
+
+  if (verifiedHome === undefined) {
+    if (!skipVerification) {
+      throw new ConfigurationError(
+        "could not verify the user home with /usr/bin/dscl; " +
+          `${ENVIRONMENT_NAMES.skipHomeVerify}=1 uses inherited HOME (insecure)`,
+      );
+    }
+    const inheritedHome = environment.HOME;
+    if (inheritedHome === undefined || inheritedHome === "") {
+      throw new ConfigurationError("HOME is unset");
+    }
+    warn(
+      `directory-service home lookup failed; using inherited HOME ` +
+        `(${ENVIRONMENT_NAMES.skipHomeVerify}=1)`,
+    );
+    return canonicalExistingDirectory(inheritedHome, "inherited HOME");
+  }
+
+  if (environment.HOME !== verifiedHome) {
+    if (!skipVerification) {
+      throw new ConfigurationError(
+        `inherited HOME (${JSON.stringify(environment.HOME ?? "")}) differs from the real user home ` +
+          `${JSON.stringify(verifiedHome)}; refusing a read-policy bypass. ` +
+          `Set ${ENVIRONMENT_NAMES.skipHomeVerify}=1 to override (insecure)`,
+      );
+    }
+    warn(
+      `inherited HOME (${JSON.stringify(environment.HOME ?? "")}) differs from the real home ` +
+        `${JSON.stringify(verifiedHome)}; using the real home ` +
+        `(${ENVIRONMENT_NAMES.skipHomeVerify}=1)`,
+    );
+  }
+  return verifiedHome;
+}
+
+function resolveTemporaryDirectory(environment: SourceEnvironment): AbsolutePath {
+  const rawTemporaryDirectory = environment.TMPDIR ?? "/tmp";
+  let candidate: AbsolutePath;
+  try {
+    candidate = canonicalExistingDirectory(rawTemporaryDirectory, "TMPDIR");
+  } catch {
+    warn(`TMPDIR (${JSON.stringify(rawTemporaryDirectory)}) is unusable; using /private/tmp`);
+    return canonicalExistingDirectory("/private/tmp", "fallback TMPDIR");
+  }
+
+  if (
+    candidate === "/private/tmp" ||
+    candidate.startsWith("/private/tmp/") ||
+    candidate.startsWith("/private/var/folders/")
+  ) {
+    return candidate;
+  }
+
+  warn(
+    `TMPDIR (${JSON.stringify(candidate)}) is not a known macOS scratch root; ` +
+      "using /private/tmp for policy",
+  );
+  return canonicalExistingDirectory("/private/tmp", "fallback TMPDIR");
+}
+
+function copyEnvironmentValue(
+  destination: ChildEnvironment,
+  source: SourceEnvironment,
+  name: string,
+): void {
+  const value = source[name];
+  if (value !== undefined && value !== "") destination[name] = value;
+}
+
+function buildCleanEnvironment(
+  source: SourceEnvironment,
+  home: AbsolutePath,
+  temporaryDirectory: AbsolutePath,
+): ChildEnvironment {
+  const clean: ChildEnvironment = {};
+  for (const name of CLEAN_ENVIRONMENT_PASSTHROUGH) copyEnvironmentValue(clean, source, name);
+
+  const requestedVariables = source[ENVIRONMENT_NAMES.pass];
+  if (requestedVariables !== undefined && requestedVariables !== "") {
+    for (const name of requestedVariables.split(":")) {
+      if (name === "") continue;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) {
+        throw new ConfigurationError(
+          `${ENVIRONMENT_NAMES.pass} contains an invalid environment name: ${JSON.stringify(name)}`,
+        );
+      }
+      if (CONTROLLED_ENVIRONMENT_NAMES.has(name)) {
+        warn(`${ENVIRONMENT_NAMES.pass}: ${JSON.stringify(name)} is wrapper-controlled and was ignored`);
+        continue;
+      }
+      const value = source[name];
+      if (value === undefined || value === "") {
+        warn(`${ENVIRONMENT_NAMES.pass}: ${JSON.stringify(name)} is unset or empty`);
+      } else {
+        clean[name] = value;
+      }
+    }
+  }
+
+  clean.HOME = home;
+  clean.TMPDIR = temporaryDirectory;
+  clean.OMP_SANDBOX = SANDBOX_MARKER;
+  clean.PI_SANDBOX = SANDBOX_MARKER;
+  Object.assign(clean, TELEMETRY_KILL_SWITCHES);
+  return clean;
+}
+
+function buildInheritedEnvironment(config: SandboxConfig): ChildEnvironment {
+  const inherited: ChildEnvironment = {};
+  for (const [name, value] of Object.entries(config.sourceEnvironment)) {
+    if (value !== undefined) inherited[name] = value;
+  }
+  inherited.HOME = config.home;
+  inherited.TMPDIR = config.temporaryDirectory;
+  inherited.OMP_SANDBOX = SANDBOX_MARKER;
+  inherited.PI_SANDBOX = SANDBOX_MARKER;
+  Object.assign(inherited, TELEMETRY_KILL_SWITCHES);
+  return inherited;
+}
+
+function loadConfig(
+  sourceEnvironment: SourceEnvironment = process.env,
+  currentDirectory: string = process.cwd(),
+): SandboxConfig {
+  const cwd = canonicalExistingDirectory(currentDirectory, "current working directory");
+  const sandboxExecutable = HOST_EXECUTABLES.sandboxExec;
+  assertExecutable(sandboxExecutable, "/usr/bin/sandbox-exec");
+
+  const ompExecutable = findExecutable("omp", sourceEnvironment.PATH, cwd);
+  if (ompExecutable === undefined) {
+    throw new ConfigurationError("'omp' was not found on PATH");
+  }
+
+  const home = resolveVerifiedHome(sourceEnvironment);
+  const rawWorkspace = sourceEnvironment[ENVIRONMENT_NAMES.workspace] ?? cwd;
+  const workspace = canonicalExistingDirectory(
+    expandHome(rawWorkspace, home),
+    "sandbox workspace",
+  );
+  if (workspace === "/" || workspace === home) {
+    if (!enabled(sourceEnvironment, ENVIRONMENT_NAMES.confirmWide)) {
+      throw new ConfigurationError(
+        `workspace ${JSON.stringify(workspace)} grants very broad access; ` +
+          `set ${ENVIRONMENT_NAMES.confirmWide}=1 to override`,
+      );
+    }
+    warn(
+      `workspace ${JSON.stringify(workspace)} grants very broad access ` +
+        `(${ENVIRONMENT_NAMES.confirmWide}=1)`,
+    );
+  }
+
+  const temporaryDirectory = resolveTemporaryDirectory(sourceEnvironment);
+  const extraPaths = resolveExtraPaths(sourceEnvironment, home);
+  const cleanEnvironment = buildCleanEnvironment(sourceEnvironment, home, temporaryDirectory);
+
+  return Object.freeze({
+    cleanEnvironment,
+    extraPaths,
+    home,
+    inheritEnvironment: enabled(sourceEnvironment, ENVIRONMENT_NAMES.inherit),
+    ompExecutable,
+    sandboxExecutable,
+    sourceEnvironment,
+    temporaryDirectory,
+    workspace,
+    yolo: enabled(sourceEnvironment, ENVIRONMENT_NAMES.yolo),
+  });
+}
+
+function escapeSeatbeltString(value: string): string {
+  if (/[\0\r\n]/u.test(value)) {
+    throw new ConfigurationError(
+      `a profile path contains a NUL or line break: ${JSON.stringify(value)}`,
+    );
+  }
+  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+function uniquePaths(paths: readonly AbsolutePath[]): readonly AbsolutePath[] {
+  return [...new Set(paths)];
+}
+
+function renderSubpaths(paths: readonly AbsolutePath[]): string {
+  return uniquePaths(paths)
+    .map((path: AbsolutePath): string => `    (subpath "${escapeSeatbeltString(path)}")`)
+    .join("\n");
+}
+
+function generateProfile(config: SandboxConfig, extraPaths: ExtraPaths = config.extraPaths): string {
+  const writePaths = [
+    config.workspace,
+    absolutePath("/private/tmp", "private temporary path"),
+    config.temporaryDirectory,
+    joinedPath(config.home, ".omp"),
+    ...extraPaths.write,
+  ] as const;
+  const readPaths = [
+    joinedPath(config.home, ".omp"),
+    joinedPath(config.home, ".bun"),
+    config.workspace,
+    ...extraPaths.read,
+  ] as const;
+  const escapedHome = escapeSeatbeltString(config.home);
+
+  return `(version 1)
 (allow default)
-;; --- process metadata: deny host process enumeration; allow self-inspection only ---
-;; OMP and child commands run at the same UID as the host shell. Without this rule
-;; any child can enumerate all host PIDs (via /bin/ps, proc_listpids, etc.) and
-;; read process metadata (argv, environment, open files) of unrelated processes.
-;; (allow process-info* (target self)) re-allows the process querying its own info,
-;; which is required by normal process startup (dyld, crash reporters, etc.).
-;; Residual: same-UID signals and IPC remain unrestricted — separate VM/UID isolation
-;; is required for strong process separation.
+
+;; Deny host-process enumeration while retaining self-inspection.
 (deny process-info*)
 (allow process-info* (target self))
 
-
-;; --- write confinement: deny all writes, re-allow only required roots ---
+;; Deny writes globally, then allow only the workspace and runtime state.
 (deny file-write*)
 (allow file-write*
-    (subpath "${_esc_ws}")
-    (subpath "/private/tmp")
-    (subpath "${_esc_tmp}")
-    (subpath "${_esc_home}/.omp")
-${EXTRA_RULES})
-;; OS per-user scratch/caches and device nodes
+${renderSubpaths(writePaths)})
 (allow file-write*
     (subpath "/private/var/folders")
     (subpath "/dev"))
 
-;; --- read confinement: deny all \$HOME, re-allow only what OMP requires ---
-;; Paths outside \$HOME (/usr, /System, /Library, /opt/homebrew, /private/*, etc.)
-;; remain readable via (allow default).
-(deny file-read* (subpath "${_esc_home}"))
+;; Deny reads under HOME, then allow only explicit subtrees.
+(deny file-read* (subpath "${escapedHome}"))
 (allow file-read*
-    (subpath "${_esc_home}/.omp")
-    (subpath "${_esc_home}/.bun")
-    (subpath "${_esc_ws}")
-${EXTRA_READ_RULES})
-;; --- home-node metadata: Go programs (filepath.EvalSymlinks / os.MkdirAll)
-;; stat() the \$HOME node itself during path canonicalization. The (subpath ...)
-;; re-allow rules above cover only DESCENDANTS of allowlisted subtrees, never the
-;; \$HOME node, so any allowlisted \$HOME subdir breaks Go path canonicalization
-;; (symptom: Go programs report "mkdir /Users/<user>: file exists" or SQLite
-;; CANTOPEN (14) even when the leaf file lives in an allowlisted dir). C binaries
-;; that just open() the leaf rely on kernel traversal and never stat the \$HOME
-;; node, so they do not expose the gap.
-;; Allow STAT of the \$HOME node ONLY — every descendant outside the allowlists
-;; above stays denied, so isolation is not weakened. file-read-metadata is the
-;; narrowest read class (stat/lstat/fstat/getattrlist); it does NOT include
-;; file-read-data (readdir, which would disclose top-level names of \$HOME) or
-;; file-write*. The disclosed metadata (mode/owner/timestamps of the \$HOME dir
-;; inode) is already world-readable via `ls -ld $HOME` outside any sandbox.
-(allow file-read-metadata (literal "${_esc_home}"))
-EOF
+${renderSubpaths(readPaths)})
+
+;; Go path canonicalization needs metadata for the HOME node itself. This does
+;; not permit readdir or file data beneath HOME.
+(allow file-read-metadata (literal "${escapedHome}"))
+`;
 }
 
-export OMP_SANDBOX=seatbelt
-export PI_SANDBOX=seatbelt
+function createTemporaryProfile(config: SandboxConfig, profile: string): TemporaryProfile {
+  const directory = absolutePath(
+    mkdtempSync(join(config.temporaryDirectory, "omp-sandbox-")),
+    "temporary profile directory",
+  );
+  const file = joinedPath(directory, "profile.sb");
+  try {
+    writeFileSync(file, profile, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (error: unknown) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+  return Object.freeze({ directory, file });
+}
 
-if [ "${1:-}" = "--self-test" ]; then
-  PROFILE="$(/usr/bin/mktemp -t omp-sandbox)"
-  _err="$(/usr/bin/mktemp -t omp-sandbox-err)"
-  trap 'rm -f "$PROFILE" "$_err"' EXIT
-  gen_profile > "$PROFILE"
-  _sb_fail=0
-  # Capture the user's original EXTRA_* so test 13 can restore $PROFILE to the
-  # entry state after clobbering it with the canary dir. (No mnemon fold here —
-  # test 16 generates its own self-contained profile below.)
-  _entry_xw="${OMP_SANDBOX_EXTRA_WRITE:-}"
-  _entry_xr="${OMP_SANDBOX_EXTRA_READ:-}"
+function removeTemporaryProfile(profile: TemporaryProfile): void {
+  rmSync(profile.directory, { recursive: true, force: true });
+}
 
-  # Export probe paths as env vars so every bash -c string below can use
-  # single quotes — no user-controlled values are interpolated into shell strings.
-  export _SBX_WS="$WORKSPACE"
-  export _SBX_WS_PROBE="$WORKSPACE/.sbx_probe"
-  export _SBX_OMP_PROBE="$HOME_DIR/.omp/.sbx_probe"
+function sandboxCommand(
+  config: SandboxConfig,
+  profileFile: AbsolutePath,
+  executable: AbsolutePath,
+  arguments_: readonly string[],
+  environment: ChildEnvironment = config.cleanEnvironment,
+): CommandResult {
+  return runCommand(
+    config.sandboxExecutable,
+    ["-f", profileFile, executable, ...arguments_],
+    { cwd: config.workspace, env: environment },
+  );
+}
 
-  # Build clean env once here; tests 6, 7, 9, 15, and 16 all use env -i "${_clean_env[@]}"
-  # so they exercise the same policy as the real exec path.
-  _sbx_build_clean_env
+function withEnvironment(
+  base: ChildEnvironment,
+  additions: Readonly<Record<string, string>>,
+): ChildEnvironment {
+  return Object.assign({}, base, additions);
+}
 
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c 'echo ok > "$_SBX_WS_PROBE" && rm "$_SBX_WS_PROBE"' 2>/dev/null; then
-    echo "PASS: workspace write allowed"
-  else
-    echo "FAIL: workspace write allowed"; _sb_fail=1
-  fi
+class SelfTestReporter {
+  #failureCount = 0;
 
-  # 2. /etc write denied
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c 'echo x > /etc/.sbx_probe' 2>/dev/null; then
-    echo "FAIL: /etc write denied"; _sb_fail=1
-  else
-    echo "PASS: /etc write denied"
-  fi
+  public check(label: string, passed: boolean, details?: string): void {
+    if (passed) {
+      console.log(`PASS: ${label}`);
+      return;
+    }
+    this.#failureCount += 1;
+    console.log(`FAIL: ${label}${details === undefined || details === "" ? "" : ` — ${details}`}`);
+  }
 
-  # 2b. $HOME write denied — genuine Seatbelt denial (skip if HOME is allowlisted)
-  _home_denied_expected=1
-  case "$HOME_DIR/" in "$WORKSPACE"/*) _home_denied_expected=0 ;; esac
-  if [ -n "${OMP_SANDBOX_EXTRA_WRITE:-}" ]; then
-    IFS=':' read -ra _ew <<< "$OMP_SANDBOX_EXTRA_WRITE"
-    for p in "${_ew[@]}"; do
-      [ -n "$p" ] || continue
-      case "$p" in "~"*) p="${HOME_DIR}${p#\~}";; esac
-      p="${p%/}"
-      case "$HOME_DIR/" in "$p"/*) _home_denied_expected=0 ;; esac
-    done
-  fi
-  if [ "$_home_denied_expected" = 1 ]; then
-    export _SBX_HOME_PROBE="$HOME_DIR/.sbx_probe.$$"
-    if /usr/bin/sandbox-exec -f "$PROFILE" \
-        /bin/bash -c 'echo x > "$_SBX_HOME_PROBE"' 2>/dev/null; then
-      echo "FAIL: \$HOME write denied"; _sb_fail=1
-      rm -f "$_SBX_HOME_PROBE" 2>/dev/null || true
-    else
-      echo "PASS: \$HOME write denied"
-    fi
-  else
-    echo "SKIP: \$HOME write denied (HOME is allowlisted for this workspace)"
-  fi
+  public skip(label: string, reason: string): void {
+    console.log(`SKIP: ${label} (${reason})`);
+  }
 
-  # 3. ~/.omp write and read allowed (OMP needs both for config, memories, sessions)
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c 'echo x > "$_SBX_OMP_PROBE" && rm "$_SBX_OMP_PROBE"' 2>/dev/null; then
-    echo "PASS: ~/.omp write allowed"
-  else
-    echo "FAIL: ~/.omp write allowed"; _sb_fail=1
-  fi
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c 'ls "$HOME/.omp" >/dev/null' 2>/dev/null; then
-    echo "PASS: ~/.omp read allowed"
-  else
-    echo "FAIL: ~/.omp read allowed"; _sb_fail=1
-  fi
+  public get exitCode(): number {
+    return this.#failureCount === 0 ? 0 : 1;
+  }
+}
 
-  # 4. workspace read allowed (proves $HOME deny + re-allow resolves correctly)
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c 'ls "$_SBX_WS" >/dev/null' 2>/dev/null; then
-    echo "PASS: workspace read allowed"
-  else
-    echo "FAIL: workspace read allowed"; _sb_fail=1
-  fi
+function outputHasEnvironmentLine(output: string, name: string, value: string): boolean {
+  return output.split("\n").includes(`${name}=${value}`);
+}
 
-  # 5. $HOME personal paths are read-denied
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c 'ls "$HOME/Library/Keychains" >/dev/null' 2>/dev/null; then
-    echo "FAIL: ~/Library/Keychains read denied"; _sb_fail=1
-  else
-    echo "PASS: ~/Library/Keychains read denied"
-  fi
-  if [ -d "$HOME_DIR/Library/Messages" ]; then
-    if /usr/bin/sandbox-exec -f "$PROFILE" \
-        /bin/bash -c 'ls "$HOME/Library/Messages" >/dev/null' 2>/dev/null; then
-      echo "FAIL: ~/Library/Messages read denied"; _sb_fail=1
-    else
-      echo "PASS: ~/Library/Messages read denied"
-    fi
-  fi
-  if [ -d "$HOME_DIR/Library/Mobile Documents" ]; then
-    if /usr/bin/sandbox-exec -f "$PROFILE" \
-        /bin/bash -c 'ls "$HOME/Library/Mobile Documents" >/dev/null' 2>/dev/null; then
-      echo "FAIL: ~/Library/Mobile Documents (iCloud) read denied"; _sb_fail=1
-    else
-      echo "PASS: ~/Library/Mobile Documents (iCloud) read denied"
-    fi
-  fi
+function commandWasDeniedInsideSandbox(result: CommandResult): boolean {
+  return result.exitCode !== 0 && !result.stderr.includes("sandbox_apply:");
+}
 
-  # 5b. process-info* denial: /bin/ps must be denied; self-inspect (bash) must succeed
-  # Proves (deny process-info*) fires for host enumeration while (allow process-info*
-  # (target self)) permits the sandboxed process to query its own metadata.
-  # /bin/ps calls proc_listpids or getproclist (KERN_PROC_ALL) — both need process-info
-  # on arbitrary targets, so rc must be non-zero when the sandbox is applied.
-  # Compatibility guard: bash -c 'echo ok' must exit 0 (normal child execution is
-  # unaffected by this rule — it is about process METADATA access, not exec).
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/ps -axo pid= >/dev/null 2>/dev/null; then
-    echo "FAIL: host process enumeration (/bin/ps) should be denied by process-info* rule"; _sb_fail=1
-  else
-    echo "PASS: host process enumeration (/bin/ps -axo) denied"
-  fi
-  if /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c 'echo ok' >/dev/null 2>/dev/null; then
-    echo "PASS: ordinary child execution unaffected (process-info* self-allow works)"
-  else
-    echo "FAIL: ordinary child execution broken (process-info* self-allow may be missing)"; _sb_fail=1
-  fi
+function runSelfTest(config: SandboxConfig): number {
+  const reporter = new SelfTestReporter();
+  if (process.env.OMP_SANDBOX === SANDBOX_MARKER) {
+    console.error(
+      `${PROGRAM_NAME}: note: already running under Seatbelt; macOS rejects nested sandbox-exec ` +
+        "profiles, so sandbox boundary checks are expected to fail here",
+    );
+  }
 
-  # 6. omp boots under the clean env (matches real launch path — not inherited env)
-  if _omp_ver="$(env -i "${_clean_env[@]}" \
-      /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" --version 2>/dev/null)" && \
-     printf '%s\n' "$_omp_ver" | grep -q '^omp/'; then
-    echo "PASS: omp boots under sandbox (clean env)"
-  else
-    echo "FAIL: omp boots under sandbox (clean env)"; _sb_fail=1
-  fi
-  if env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$PROFILE" \
-      "$OMP_BIN" --auto-approve --version 2>/dev/null | grep -q '^[0-9]'; then
-    echo "PASS: --auto-approve flag accepted by omp (clean env)"
-  else
-    echo "FAIL: --auto-approve flag accepted by omp (clean env)"; _sb_fail=1
-  fi
+  for (const [name, expected] of Object.entries(TELEMETRY_KILL_SWITCHES)) {
+    reporter.check(
+      `clean environment sets ${name}=${expected}`,
+      config.cleanEnvironment[name] === expected,
+    );
+  }
+  const inheritedEnvironment = buildInheritedEnvironment(config);
+  for (const [name, expected] of Object.entries(TELEMETRY_KILL_SWITCHES)) {
+    reporter.check(
+      `inherited environment forces ${name}=${expected}`,
+      inheritedEnvironment[name] === expected,
+    );
+  }
 
-  # 7. sandbox env markers visible inside the sandbox
-  _env_out="$(env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$PROFILE" /usr/bin/env 2>/dev/null || true)"
-  if printf '%s\n' "$_env_out" | grep -qx 'OMP_SANDBOX=seatbelt' && \
-     printf '%s\n' "$_env_out" | grep -qx 'PI_SANDBOX=seatbelt'; then
-    echo "PASS: sandbox env marker set"
-  else
-    echo "FAIL: sandbox env marker set"; _sb_fail=1
-  fi
+  const telemetryEnvironmentResult = runCommand(HOST_EXECUTABLES.env, [], {
+    env: config.cleanEnvironment,
+  });
+  reporter.check(
+    "OTel kill-switches reach a clean-environment child",
+    telemetryEnvironmentResult.exitCode === 0 &&
+      Object.entries(TELEMETRY_KILL_SWITCHES).every(([name, value]): boolean =>
+        outputHasEnvironmentLine(telemetryEnvironmentResult.stdout, name, value),
+      ),
+  );
 
-  # 8. TMPDIR_CANON is a known macOS scratch root (adversarial: TMPDIR poisoning)
-  case "$TMPDIR_CANON" in
-    /private/tmp|/private/tmp/*|/private/var/folders/*)
-      echo "PASS: TMPDIR scratch root is valid ($TMPDIR_CANON)" ;;
-    *)
-      echo "FAIL: TMPDIR ($TMPDIR_CANON) is not a known macOS scratch root"; _sb_fail=1 ;;
-  esac
+  const temporaryProfile = createTemporaryProfile(config, generateProfile(config));
+  const profileFile = temporaryProfile.file;
+  const probeEnvironment = withEnvironment(config.cleanEnvironment, {
+    _SBX_HOME_PROBE: joinedPath(config.home, `.omp-sandbox-probe-${process.pid}`),
+    _SBX_OMP_PROBE: joinedPath(config.home, ".omp", ".omp-sandbox-probe"),
+    _SBX_WS: config.workspace,
+    _SBX_WS_PROBE: joinedPath(config.workspace, ".omp-sandbox-probe"),
+  });
 
-  # 9. Adversarial env-isolation via shared _sbx_build_clean_env (Finding-3)
-  # Canary is set after _sbx_build_clean_env so it is guaranteed absent from _clean_env;
-  # env -i must then exclude it — same code path as the real exec.
-  export _SBX_SECRET_CANARY="sbx-canary-$$"
-  _env_isolated_out="$(env -i "${_clean_env[@]}" \
-      /usr/bin/sandbox-exec -f "$PROFILE" /usr/bin/env 2>/dev/null || true)"
-  if printf '%s\n' "$_env_isolated_out" | grep -q '_SBX_SECRET_CANARY'; then
-    echo "FAIL: secret canary visible inside clean env-i sandbox"; _sb_fail=1
-  else
-    echo "PASS: secret canary absent from clean env-i sandbox"
-  fi
-  unset _SBX_SECRET_CANARY
+  try {
+    let result = sandboxCommand(
+      config,
+      profileFile,
+      HOST_EXECUTABLES.bash,
+      ["-c", 'echo ok > "$_SBX_WS_PROBE" && rm -f "$_SBX_WS_PROBE"'],
+      probeEnvironment,
+    );
+    reporter.check("workspace write allowed", result.exitCode === 0, result.stderr.trim());
 
-  # 10. Sensitive EXTRA_WRITE path detection (adversarial: EXTRA_WRITE denylist)
-  if _sbx_sensitive_path "$HOME_DIR/.ssh"; then
-    echo "PASS: .ssh detected as sensitive EXTRA_WRITE target"
-  else
-    echo "FAIL: .ssh not detected as sensitive EXTRA_WRITE target"; _sb_fail=1
-  fi
+    result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.bash, [
+      "-c",
+      "echo x > /etc/.omp-sandbox-probe && rm -f /etc/.omp-sandbox-probe",
+    ]);
+    reporter.check("/etc write denied", commandWasDeniedInsideSandbox(result), result.stderr.trim());
 
-  # 11. Home-node metadata stat allowed (Go path-canonicalization regression)
-  # Go programs (filepath.EvalSymlinks / os.MkdirAll) stat() the $HOME node itself
-  # when canonicalizing a path under an allowlisted $HOME subtree. The (subpath ...)
-  # read re-allows cover only DESCENDANTS, not the $HOME node, so without the
-  # explicit (allow file-read-metadata (literal $HOME)) rule the stat walk fails
-  # and Go binaries error out with "mkdir /Users/<user>: file exists" or SQLite
-  # CANTOPEN (14) even on allowlisted paths. C binaries that just open() the leaf
-  # never expose the gap, so this test must stat() $HOME itself.
-  # Uses the clean env (matches the real exec path). HOME is in _clean_env.
-  if env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c '/usr/bin/stat -f "%Su" "$HOME" >/dev/null' 2>/dev/null; then
-    echo "PASS: \$HOME node metadata stat allowed"
-  else
-    echo "FAIL: \$HOME node metadata stat allowed (Go path-canonicalization regressed)"; _sb_fail=1
-  fi
+    const homeWriteShouldBeDenied =
+      !isWithinOrEqual(config.workspace, config.home) &&
+      !config.extraPaths.write.some((path: AbsolutePath): boolean =>
+        isWithinOrEqual(path, config.home),
+      );
+    if (homeWriteShouldBeDenied) {
+      result = sandboxCommand(
+        config,
+        profileFile,
+        HOST_EXECUTABLES.bash,
+        ["-c", 'echo x > "$_SBX_HOME_PROBE"'],
+        probeEnvironment,
+      );
+      reporter.check(
+        "HOME write denied",
+        commandWasDeniedInsideSandbox(result),
+        result.stderr.trim(),
+      );
+      if (result.exitCode === 0) rmSync(probeEnvironment._SBX_HOME_PROBE, { force: true });
+    } else {
+      reporter.skip("HOME write denied", "HOME is covered by a write allowlist");
+    }
 
-  # 12. Home-node readdir stays DENIED (narrowness guard on the rule above)
-  # Companion to test 11: stat() of $HOME passes under BOTH file-read-metadata
-  # (the narrow rule this PR adds) AND a wider file-read* rule, so test 11 alone
-  # cannot catch an accidental widening that would also grant readdir of $HOME
-  # and disclose its top-level entry names (~/.ssh, ~/.aws, etc. by name).
-  # opendir/readdir uses file-read-data on the directory node — a class NOT
-  # covered by file-read-metadata. So `ls "$HOME"` MUST still fail; this
-  # assertion flips (LEAK_BAD) iff someone broadens the carve-out to
-  # (allow file-read* (literal "$HOME")), making the narrowness self-enforcing.
-  # Clean env (matches the real exec path); HOME is in _clean_env.
-  if env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$PROFILE" \
-      /bin/bash -c 'ls "$HOME" >/dev/null' 2>/dev/null; then
-    echo "FAIL: \$HOME node readdir still denied (carve-out was widened — top-level names now disclosed)"; _sb_fail=1
-  else
-    echo "PASS: \$HOME node readdir still denied"
-  fi
+    result = sandboxCommand(
+      config,
+      profileFile,
+      HOST_EXECUTABLES.bash,
+      ["-c", 'echo x > "$_SBX_OMP_PROBE" && rm -f "$_SBX_OMP_PROBE"'],
+      probeEnvironment,
+    );
+    reporter.check("~/.omp write allowed", result.exitCode === 0, result.stderr.trim());
 
-  # 13. EXTRA_READ build-block fires + sensitive-path gate denies ~/.ssh without confirm
-  # OMP_SANDBOX_EXTRA_READ is the read-side mirror of EXTRA_WRITE (same canon helper,
-  # same sensitive-path denylist, its own OMP_SANDBOX_CONFIRM_SENSITIVE_READ gate).
-  # This test exercises the build block end-to-end via --print-profile (the same
-  # code the real exec runs to build EXTRA_READ_RULES). Two assertions:
-  #   (a) EXTRA_READ=~/.ssh with confirm unset -> profile-gen MUST abort with the
-  #       sensitive-deny error (an attacker could otherwise read SSH keys by
-  #       listing them in EXTRA_READ; reading secrets is as bad as writing them).
-  #   (b) EXTRA_READ=~/.ssh with CONFIRM_SENSITIVE_READ=1 -> profile-gen succeeds
-  #       and the profile MUST contain ~/.ssh as a subpath of the read-allow block.
-  if OMP_SANDBOX_EXTRA_READ="$HOME_DIR/.ssh" OMP_SANDBOX_WORKSPACE="$WORKSPACE" \
-       "$0" --print-profile >/dev/null 2>"$_err"; then
-    echo "FAIL: EXTRA_READ sensitive-path gate did not fire (~/.ssh accepted without CONFIRM_SENSITIVE_READ=1)"; _sb_fail=1
-  elif ! grep -q 'sensitive home location' "$_err"; then
-    echo "FAIL: EXTRA_READ=~/.ssh rejected, but not via the sensitive-path gate:" >&2
-    cat "$_err" >&2; _sb_fail=1
-  else
-    echo "PASS: EXTRA_READ sensitive-path gate rejects ~/.ssh without CONFIRM_SENSITIVE_READ=1"
-  fi
-  if OMP_SANDBOX_EXTRA_READ="$HOME_DIR/.ssh" OMP_SANDBOX_CONFIRM_SENSITIVE_READ=1 \
-       OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile 2>/dev/null \
-       | grep -q "subpath \"$HOME_DIR/.ssh\")"; then
-    echo "PASS: EXTRA_READ ~/.ssh allowed with CONFIRM_SENSITIVE_READ=1 (appears in read allowlist)"
-  else
-    echo "FAIL: EXTRA_READ ~/.ssh + CONFIRM_SENSITIVE_READ=1 did not produce the expected subpath rule" >&2
-    _sb_fail=1
-  fi
+    result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.ls, [
+      joinedPath(config.home, ".omp"),
+    ]);
+    reporter.check("~/.omp read allowed", result.exitCode === 0, result.stderr.trim());
 
-  # 13c. EXTRA_READ path is actually READABLE in the sandbox (the whole point).
-  # The two assertions above only check the sensitive-path GATE at profile-gen
-  # time. This one exercises the feature end-to-end inside a real sandbox:
-  # place a canary file under a $HOME subdir that NO baseline allowlist covers
-  # (~/.omp and $WORKSPACE only), then assert:
-  #   (i)  baseline (no EXTRA_READ): cat is DENIED by the $HOME read-deny rule
-  #   (ii) with EXTRA_READ=that subdir: cat SUCCEEDS, proving the EXTRA_READ
-  #        (subpath ...) rule opened the path through the $HOME deny.
-  # Placing the canary inside $HOME is what makes this test meaningful — outside
-  # $HOME everything is already readable via (allow default), so an outside-$HOME
-  # canary would pass the same way with or without EXTRA_READ and prove nothing.
-  # Mirrors self-tests #3/#4 (which probe reads via sandbox-exec -f "$PROFILE"
-  # /bin/bash -c 'cat ...' directly, not through omp).
-  _extread_root="$HOME_DIR/.sbx_extread_$$"
-  rm -rf "$_extread_root" 2>/dev/null || true
-  mkdir -p "$_extread_root/sub" && echo "extread-canary" > "$_extread_root/sub/file"
-  trap 'rm -f "$PROFILE" "$_err"; rm -rf "$_extread_root" 2>/dev/null || true' EXIT
-  # (i) baseline: EXTRA_READ unset, cat must FAIL
-  if env -i "${_clean_env[@]}" OMP_SANDBOX_WORKSPACE="$WORKSPACE" \
-       /usr/bin/sandbox-exec -f "$PROFILE" /bin/bash -c \
-       "cat '$_extread_root/sub/file' >/dev/null 2>&1" 2>/dev/null; then
-    echo "FAIL: EXTRA_READ canary was readable WITHOUT EXTRA_READ (\$HOME deny did not fire — EXTRA_READ has no work to do)"; _sb_fail=1
-    rm -rf "$_extread_root"
-  else
-    # (ii) with EXTRA_READ: cat must SUCCEED. Regenerate the profile with EXTRA_READ
-    # set so EXTRA_READ_RULES picks up the canary dir; then sandbox-exec the cat.
-    OMP_SANDBOX_EXTRA_READ="$_extread_root/sub" OMP_SANDBOX_WORKSPACE="$WORKSPACE" \
-      "$0" --print-profile > "$PROFILE"
-    if env -i "${_clean_env[@]}" OMP_SANDBOX_WORKSPACE="$WORKSPACE" \
-         /usr/bin/sandbox-exec -f "$PROFILE" /bin/bash -c \
-         "cat '$_extread_root/sub/file' >/dev/null" 2>/dev/null; then
-      echo "PASS: EXTRA_READ path is readable inside the sandbox (EXTRA_READ rule opened the \$HOME-denied path)"
-    else
-      echo "FAIL: EXTRA_READ path was NOT readable inside the sandbox — feature does not work end-to-end" >&2
-      _sb_fail=1
-    fi
-    rm -rf "$_extread_root"
-    # Restore $PROFILE to the entry state (the user's original EXTRA_*) so later
-    # tests aren't perturbed by the canary-dir profile above.
-    OMP_SANDBOX_EXTRA_WRITE="${_entry_xw:-}" OMP_SANDBOX_EXTRA_READ="${_entry_xr:-}" \
-      OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$PROFILE"
-  fi
+    result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.ls, [config.workspace]);
+    reporter.check("workspace read allowed", result.exitCode === 0, result.stderr.trim());
 
-# 14. bash-3.2 empty-array safety (${arr[@]+"${arr[@]}"} idiom)
-# On Apple stock /bin/bash (3.2.57), "${arr[@]}" on an empty array under set -u
-# raises "unbound variable" — even when the array was initialized as () (a known
-# bash 3.x bug fixed in 4.4). The exec path expands OMP_LAUNCH_ARGS when YOLO
-# running the script under /bin/bash (Apple's stock 3.2) with YOLO unset (empty
-# OMP_LAUNCH_ARGS) and --version (reaches the exec path). If the crash
-# persists, "unbound variable" appears in stderr.
-_SBX_B32_DIR="$(/usr/bin/mktemp -d -t omp-sandbox-b32-$$)"
-# Capture output separately (not in a pipeline) so pipefail in the parent
-# doesn't mask grep's result — the subprocess crashes with exit!=0 either way.
-_SBX_B32_OUT="$(OMP_SANDBOX_WORKSPACE="$_SBX_B32_DIR" /bin/bash "$0" --version 2>&1 || true)"
-if printf '%s\n' "$_SBX_B32_OUT" | /usr/bin/grep -q 'unbound variable'; then
-  echo "FAIL: bash-3.2 empty-array crash persists under /bin/bash (OMP_LAUNCH_ARGS[@]: unbound variable)"
-  _sb_fail=1
-else
-  echo "PASS: bash-3.2 empty-array crash is fixed (\${arr[@]+...} idiom)"
-fi
-rm -rf "$_SBX_B32_DIR"
+    const deniedHomeLocations = [
+      joinedPath(config.home, "Library", "Keychains"),
+      joinedPath(config.home, "Library", "Messages"),
+      joinedPath(config.home, "Library", "Mobile Documents"),
+    ] as const;
+    for (const location of deniedHomeLocations) {
+      if (!existsSync(location)) continue;
+      result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.ls, [location]);
+      reporter.check(
+        `${location.slice(config.home.length + 1)} read denied`,
+        commandWasDeniedInsideSandbox(result),
+        result.stderr.trim(),
+      );
+    }
 
-# 15. OTEL kill-switches survive the env -i boundary. Without them the
-# wrapper strips the user's own kill-switches, exposing a Bun node:http2
-# crash (TypeError: authority must be string, received number 825110816
-# = 0x312e3120) in an OMP-launched telemetry path. Exact component
-# [INFERENCE]; public reproductions match Claude Code OTel gRPC issues.
-_t15_otel=$(env -i "${_clean_env[@]}" /bin/bash -c 'echo "SDK=${OTEL_SDK_DISABLED} TRACES=${OTEL_TRACES_EXPORTER}"')
-if [ "$_t15_otel" = "SDK=true TRACES=none" ]; then
-  echo "PASS: OTEL kill-switches present in clean env (OTEL_SDK_DISABLED=true, OTEL_TRACES_EXPORTER=none)"
-else
-  echo "FAIL: OTEL kill-switches missing or wrong in clean env: got '$_t15_otel'" >&2
-  _sb_fail=1
-fi
+    result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.ps, ["-axo", "pid="]);
+    reporter.check(
+      "host process enumeration denied",
+      commandWasDeniedInsideSandbox(result),
+      result.stderr.trim(),
+    );
 
-  # 16. mnemon store reachable under a profile that allowlists ~/.mnemon via the
-  # EXTRA_* mechanism (the same mechanism users use in production). SELF-
-  # CONTAINED: this test generates its OWN profile (with EXTRA_*=~/.mnemon) rather
-  # than reusing $PROFILE, so it cannot be silently fed or broken by test 13's
-  # clobber-then-restore of $PROFILE. Asserts recall RETURNED a result (grep
-  # '"id"'), not just exit 0 — `mnemon recall` can exit 0 with empty output on
-  # some failure modes, which would otherwise be a false pass.
-  if [ -d "$HOME_DIR/.mnemon" ] && command -v mnemon >/dev/null 2>&1; then
-    _t16_prof="$(/usr/bin/mktemp -t omp-sandbox-t16)"
-    OMP_SANDBOX_EXTRA_WRITE="$HOME_DIR/.mnemon" \
-    OMP_SANDBOX_EXTRA_READ="$HOME_DIR/.mnemon" \
-    OMP_SANDBOX_WORKSPACE="$WORKSPACE" "$0" --print-profile > "$_t16_prof"
-    _t16_out=$(env -i "${_clean_env[@]}" /usr/bin/sandbox-exec -f "$_t16_prof" \
-        mnemon recall __omp_sandbox_selftest__ --limit 1 2>&1) || _t16_out=""
-    rm -f "$_t16_prof"
-    if printf '%s\n' "$_t16_out" | grep -q '"id"'; then
-      echo "PASS: mnemon store reachable under sandbox (recall returned a result)"
-    else
-      echo "FAIL: mnemon store NOT reachable under sandbox (recall returned no result)" >&2
-      printf '%s\n' "$_t16_out" | head -5 >&2
-      _sb_fail=1
-    fi
-  else
-    echo "SKIP: mnemon store reachability (mnemon not installed or store dir absent)"
-  fi
+    result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.bash, ["-c", "echo ok"]);
+    reporter.check("ordinary child execution allowed", result.exitCode === 0, result.stderr.trim());
 
-  exit "$_sb_fail"
-fi
+    result = sandboxCommand(config, profileFile, config.ompExecutable, ["--version"]);
+    reporter.check(
+      "omp boots under the sandbox clean environment",
+      result.exitCode === 0 && result.stdout.startsWith("omp/"),
+      result.stderr.trim(),
+    );
 
-if [ "${1:-}" = "--print-profile" ]; then
-  gen_profile; exit 0
-fi
+    result = sandboxCommand(config, profileFile, config.ompExecutable, [
+      "--auto-approve",
+      "--version",
+    ]);
+    reporter.check(
+      "omp accepts --auto-approve",
+      result.exitCode === 0 && /^\d/u.test(result.stdout),
+      result.stderr.trim(),
+    );
 
-PROFILE="$(/usr/bin/mktemp -t omp-sandbox)"
-trap 'rm -f "$PROFILE"' EXIT
-gen_profile > "$PROFILE"
+    result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.env, []);
+    reporter.check(
+      "sandbox environment markers are set",
+      result.exitCode === 0 &&
+        outputHasEnvironmentLine(result.stdout, "OMP_SANDBOX", SANDBOX_MARKER) &&
+        outputHasEnvironmentLine(result.stdout, "PI_SANDBOX", SANDBOX_MARKER),
+    );
 
-# YOLO: auto-approve all tool calls when OMP_SANDBOX_YOLO=1 (opt-in).
-OMP_LAUNCH_ARGS=()
-if [ "${OMP_SANDBOX_YOLO:-0}" = 1 ]; then
-  OMP_LAUNCH_ARGS+=(--auto-approve)
-fi
+    reporter.check(
+      `TMPDIR scratch root is valid (${config.temporaryDirectory})`,
+      config.temporaryDirectory === "/private/tmp" ||
+        config.temporaryDirectory.startsWith("/private/tmp/") ||
+        config.temporaryDirectory.startsWith("/private/var/folders/"),
+    );
 
-# Assemble clean environment via the shared helper (Finding-3).
-# OMP_SANDBOX_INHERIT_ENV=1 skips this and passes the full parent env (insecure).
-if [ "${OMP_SANDBOX_INHERIT_ENV:-0}" != "1" ]; then
-  _sbx_build_clean_env
-fi
+    const canaryEnvironment = withEnvironment(config.cleanEnvironment, {
+      _SBX_SECRET_CANARY: `omp-sandbox-canary-${process.pid}`,
+    });
+    const cleanChildResult = sandboxCommand(
+      config,
+      profileFile,
+      HOST_EXECUTABLES.env,
+      [],
+      config.cleanEnvironment,
+    );
+    reporter.check(
+      "non-allowlisted secret canary is absent from clean environment",
+      canaryEnvironment._SBX_SECRET_CANARY !== undefined &&
+        !cleanChildResult.stdout.includes("_SBX_SECRET_CANARY="),
+    );
 
-cd "$WORKSPACE"
-if [ "${OMP_SANDBOX_INHERIT_ENV:-0}" = "1" ]; then
-  echo "omp-sandboxed: warning: OMP_SANDBOX_INHERIT_ENV=1 — full parent env passed to sandbox (insecure)" >&2
-  exec /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]+"${OMP_LAUNCH_ARGS[@]}"}" "$@"
-else
-  exec /usr/bin/env -i "${_clean_env[@]}" \
-    /usr/bin/sandbox-exec -f "$PROFILE" "$OMP_BIN" "${OMP_LAUNCH_ARGS[@]+"${OMP_LAUNCH_ARGS[@]}"}" "$@"
-fi
+    reporter.check(
+      ".ssh is detected as a sensitive EXTRA_WRITE target",
+      overlapsSensitiveHomePath(joinedPath(config.home, ".ssh"), config.home),
+    );
+
+    result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.stat, [
+      "-f",
+      "%Su",
+      config.home,
+    ]);
+    reporter.check("HOME node metadata stat allowed", result.exitCode === 0, result.stderr.trim());
+
+    result = sandboxCommand(config, profileFile, HOST_EXECUTABLES.ls, [config.home]);
+    reporter.check(
+      "HOME node readdir remains denied",
+      commandWasDeniedInsideSandbox(result),
+      result.stderr.trim(),
+    );
+
+    const unconfirmedSensitiveReadEnvironment: SourceEnvironment = {
+      ...config.sourceEnvironment,
+      [ENVIRONMENT_NAMES.confirmSensitiveRead]: undefined,
+      [ENVIRONMENT_NAMES.extraRead]: joinedPath(config.home, ".ssh"),
+    };
+    let sensitiveReadRejected = false;
+    try {
+      resolveExtraPathList(unconfirmedSensitiveReadEnvironment, config.home, "READ");
+    } catch (error: unknown) {
+      sensitiveReadRejected =
+        error instanceof ConfigurationError && error.message.includes("sensitive home location");
+    }
+    reporter.check("EXTRA_READ rejects ~/.ssh without confirmation", sensitiveReadRejected);
+
+    const confirmedSensitiveReadEnvironment: SourceEnvironment = {
+      ...unconfirmedSensitiveReadEnvironment,
+      [ENVIRONMENT_NAMES.confirmSensitiveRead]: "1",
+    };
+    const confirmedSensitiveRead = resolveExtraPathList(
+      confirmedSensitiveReadEnvironment,
+      config.home,
+      "READ",
+    );
+    reporter.check(
+      "EXTRA_READ allows ~/.ssh with confirmation",
+      confirmedSensitiveRead.includes(joinedPath(config.home, ".ssh")) &&
+        generateProfile(config, { read: confirmedSensitiveRead, write: [] }).includes(
+          `(subpath "${escapeSeatbeltString(joinedPath(config.home, ".ssh"))}")`,
+        ),
+    );
+
+    runExtraReadCanaryTest(config, profileFile, reporter);
+    runMnemonTest(config, reporter);
+  } finally {
+    removeTemporaryProfile(temporaryProfile);
+  }
+
+  return reporter.exitCode;
+}
+
+function runExtraReadCanaryTest(
+  config: SandboxConfig,
+  baselineProfileFile: AbsolutePath,
+  reporter: SelfTestReporter,
+): void {
+  let canaryRoot: AbsolutePath | undefined;
+  let extraProfile: TemporaryProfile | undefined;
+  try {
+    canaryRoot = absolutePath(
+      mkdtempSync(join(config.home, ".omp-sandbox-extra-read-")),
+      "EXTRA_READ canary directory",
+    );
+    const canaryFile = joinedPath(canaryRoot, "canary");
+    writeFileSync(canaryFile, "extra-read-canary\n", { encoding: "utf8", mode: 0o600 });
+    const environment = withEnvironment(config.cleanEnvironment, { _SBX_CANARY: canaryFile });
+
+    const baselineResult = sandboxCommand(
+      config,
+      baselineProfileFile,
+      HOST_EXECUTABLES.bash,
+      ["-c", 'cat "$_SBX_CANARY" >/dev/null'],
+      environment,
+    );
+    if (!commandWasDeniedInsideSandbox(baselineResult)) {
+      reporter.check(
+        "EXTRA_READ baseline denies canary",
+        false,
+        baselineResult.exitCode === 0
+          ? "canary was already readable"
+          : baselineResult.stderr.trim(),
+      );
+      return;
+    }
+    reporter.check("EXTRA_READ baseline denies canary", true);
+
+    const extraPaths: ExtraPaths = { read: [canaryRoot], write: [] };
+    extraProfile = createTemporaryProfile(config, generateProfile(config, extraPaths));
+    const allowedResult = sandboxCommand(
+      config,
+      extraProfile.file,
+      HOST_EXECUTABLES.bash,
+      ["-c", 'cat "$_SBX_CANARY" >/dev/null'],
+      environment,
+    );
+    reporter.check(
+      "EXTRA_READ canary is readable when allowlisted",
+      allowedResult.exitCode === 0,
+      allowedResult.stderr.trim(),
+    );
+  } catch (error: unknown) {
+    reporter.check(
+      "EXTRA_READ end-to-end canary",
+      false,
+      error instanceof Error ? error.message : String(error),
+    );
+  } finally {
+    if (extraProfile !== undefined) removeTemporaryProfile(extraProfile);
+    if (canaryRoot !== undefined) rmSync(canaryRoot, { recursive: true, force: true });
+  }
+}
+
+function runMnemonTest(config: SandboxConfig, reporter: SelfTestReporter): void {
+  const store = joinedPath(config.home, ".mnemon");
+  const executable = findExecutable("mnemon", config.sourceEnvironment.PATH, config.workspace);
+  if (!existsSync(store) || executable === undefined) {
+    reporter.skip("mnemon store reachable", "mnemon is not installed or ~/.mnemon is absent");
+    return;
+  }
+
+  const profile = createTemporaryProfile(
+    config,
+    generateProfile(config, { read: [store], write: [store] }),
+  );
+  try {
+    const result = sandboxCommand(config, profile.file, executable, [
+      "recall",
+      "__omp_sandbox_selftest__",
+      "--limit",
+      "1",
+    ]);
+    reporter.check(
+      "mnemon store reachable under explicit read/write allowlists",
+      result.exitCode === 0 && result.stdout.includes('"id"'),
+      result.stderr.trim(),
+    );
+  } finally {
+    removeTemporaryProfile(profile);
+  }
+}
+
+async function runSandboxedOmp(
+  config: SandboxConfig,
+  profile: string,
+  arguments_: readonly string[],
+  environment: ChildEnvironment,
+): Promise<LaunchResult> {
+  const startedAt = performance.now();
+  const child = spawn(
+    config.sandboxExecutable,
+    ["-p", profile, config.ompExecutable, ...arguments_],
+    {
+      cwd: config.workspace,
+      env: environment,
+      stdio: "inherit",
+    },
+  );
+
+  // The child remains in this foreground process group and inherits the TTY
+  // descriptors, so terminal-generated signals and window changes reach it
+  // directly. Keep the supervisor alive while OMP handles Ctrl-C/Ctrl-\ itself,
+  // and relay lifecycle signals that may be sent only to the wrapper PID.
+  const retainSupervisor = (): void => {};
+  const forwardSignal = (signal: NodeJS.Signals): void => {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+  };
+  const forwardHangup = (): void => forwardSignal("SIGHUP");
+  const forwardTermination = (): void => forwardSignal("SIGTERM");
+  process.on("SIGINT", retainSupervisor);
+  process.on("SIGQUIT", retainSupervisor);
+  process.on("SIGHUP", forwardHangup);
+  process.on("SIGTERM", forwardTermination);
+
+  try {
+    const result = await new Promise<{
+      readonly exitCode: number | null;
+      readonly signal: NodeJS.Signals | null;
+    }>((resolvePromise, rejectPromise): void => {
+      child.once("error", rejectPromise);
+      child.once("exit", (exitCode, signal): void => {
+        resolvePromise({ exitCode, signal });
+      });
+    });
+    return Object.freeze({
+      elapsedMilliseconds: performance.now() - startedAt,
+      ...result,
+    });
+  } finally {
+    process.off("SIGINT", retainSupervisor);
+    process.off("SIGQUIT", retainSupervisor);
+    process.off("SIGHUP", forwardHangup);
+    process.off("SIGTERM", forwardTermination);
+  }
+}
+
+async function launch(config: SandboxConfig, arguments_: readonly string[]): Promise<number> {
+  const childEnvironment = config.inheritEnvironment
+    ? buildInheritedEnvironment(config)
+    : config.cleanEnvironment;
+  if (config.inheritEnvironment) {
+    warn(`${ENVIRONMENT_NAMES.inherit}=1 passes the full parent environment (insecure)`);
+  }
+
+  const ompArguments = config.yolo ? ["--auto-approve", ...arguments_] : [...arguments_];
+  const profile = generateProfile(config);
+  process.chdir(config.workspace);
+
+  for (let attempt = 0; ; attempt += 1) {
+    const result = await runSandboxedOmp(config, profile, ompArguments, childEnvironment);
+    if (result.signal !== null) {
+      process.kill(process.pid, result.signal);
+      return 1;
+    }
+
+    const exitCode = result.exitCode ?? 1;
+    const shouldRetry =
+      attempt === 0 &&
+      exitCode !== 0 &&
+      result.elapsedMilliseconds <= STARTUP_RETRY_WINDOW_MS;
+    if (!shouldRetry) return exitCode;
+
+    warn(
+      `omp exited with code ${exitCode} after ${Math.round(result.elapsedMilliseconds)}ms; ` +
+        "retrying startup once",
+    );
+  }
+}
+
+async function main(arguments_: readonly string[] = process.argv.slice(2)): Promise<number> {
+  const config = loadConfig();
+  if (arguments_[0] === "--print-profile") {
+    process.stdout.write(generateProfile(config));
+    return 0;
+  }
+  if (arguments_[0] === "--self-test") return runSelfTest(config);
+  return launch(config, arguments_);
+}
+
+if (import.meta.main) {
+  try {
+    process.exitCode = await main();
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`${PROGRAM_NAME}: error: ${message}`);
+    process.exitCode = 1;
+  }
+}
